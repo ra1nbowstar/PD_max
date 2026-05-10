@@ -703,6 +703,11 @@ class TLService:
                         f"dw.address AS `地址`, "
                         f"dw.province AS `省`, dw.city AS `市`, dw.district AS `区`, "
                         f"dw.longitude AS `经度`, dw.latitude AS `纬度`, "
+                        f"dw.contact_name AS `库房联系人`, "
+                        f"dw.contact_phone AS `电话`, "
+                        f"dw.hazardous_waste_license_qty AS `危废经营许可数量`, "
+                        f"dw.monthly_avg_receipt_ton AS `月均收货`, "
+                        f"dw.freight_amount AS `运费`, "
                         f"dw.warehouse_type_id AS `仓库类型id`, "
                         f"wt.name AS `类型`, wt.color_config AS `库房类型颜色配置`, "
                         f"dw.color_config AS `仓库颜色配置` "
@@ -717,6 +722,16 @@ class TLService:
                     out: List[Dict[str, Any]] = []
                     for row in rows:
                         rec = dict(zip(columns, row))
+                        hw = rec.get("危废经营许可数量")
+                        mar = rec.get("月均收货")
+                        fa = rec.get("运费")
+                        rec["库房联系人"] = rec.get("库房联系人") or ""
+                        rec["电话"] = rec.get("电话") or ""
+                        rec["危废经营许可数量"] = (
+                            float(hw) if hw is not None else None
+                        )
+                        rec["月均收货"] = float(mar) if mar is not None else None
+                        rec["运费"] = float(fa) if fa is not None else None
                         type_cc = _color_config_from_db(rec.get("库房类型颜色配置"))
                         wh_cc = _color_config_from_db(rec.get("仓库颜色配置"))
                         rec["库房类型颜色配置"] = type_cc
@@ -2283,12 +2298,32 @@ class TLService:
 
                     # 请求中的每个「仓库×启用冶炼厂」都应有明细行；无运费记录时按 0 元/吨补全，避免与所选冶炼厂列表对不齐
                     cur.execute(
-                        f"SELECT id, name FROM dict_warehouses WHERE id IN ({wh_ph})",
+                        f"SELECT id, name, contact_name, contact_phone, "
+                        f"hazardous_waste_license_qty, monthly_avg_receipt_ton, freight_amount "
+                        f"FROM dict_warehouses WHERE id IN ({wh_ph})",
                         tuple(warehouse_ids),
                     )
-                    wid_to_name: Dict[int, str] = {
-                        int(r[0]): str(r[1]) for r in cur.fetchall()
-                    }
+                    wid_to_name: Dict[int, str] = {}
+                    wid_to_wh_ext: Dict[int, Dict[str, Any]] = {}
+                    for r in cur.fetchall():
+                        wid_i = int(r[0])
+                        wid_to_name[wid_i] = str(r[1])
+                        hw_v, mar_v, fa_v = r[4], r[5], r[6]
+                        wid_to_wh_ext[wid_i] = {
+                            "库房联系人": (r[2] or "") if r[2] is not None else "",
+                            "电话": (r[3] or "") if r[3] is not None else "",
+                            "危废经营许可数量": (
+                                float(hw_v) if hw_v is not None else None
+                            ),
+                            "月均收货": (
+                                float(mar_v) if mar_v is not None else None
+                            ),
+                            # 与 get_warehouses 中 dict_warehouses.freight_amount 一致；
+                            # 明细顶层已有「运费」表示全程运费(元)，此处用「运费参考」避免键冲突
+                            "运费参考": (
+                                float(fa_v) if fa_v is not None else None
+                            ),
+                        }
                     cur.execute(
                         f"SELECT id, name FROM dict_factories WHERE id IN ({sm_ph})",
                         tuple(smelter_ids),
@@ -2585,6 +2620,16 @@ class TLService:
                         metrics_exc = metrics_inc
                         top = metrics_inc
 
+                    wext = wid_to_wh_ext.get(
+                        int(wid),
+                        {
+                            "库房联系人": "",
+                            "电话": "",
+                            "危废经营许可数量": None,
+                            "月均收货": None,
+                            "运费参考": None,
+                        },
+                    )
                     rec: Dict[str, Any] = {
                         "仓库id": wid,
                         "冶炼厂id": fid,
@@ -2595,6 +2640,7 @@ class TLService:
                         "price_type": price_type_name,
                         "吨数": t,
                         "运费计价方式": "per_ton",
+                        **wext,
                         **top,
                         "冶炼厂循融宝发货": 1 if xrb_on else 0,
                         "循融宝加价元每吨": (
