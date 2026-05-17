@@ -7026,6 +7026,9 @@ class TLService:
         has_gross_margin: Optional[bool] = None,
         has_spread_config: Optional[bool] = None,
         as_of_date: Optional[str] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
             raise ValueError("page 必须 >= 1")
