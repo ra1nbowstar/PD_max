@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Optional
+from typing import FrozenSet, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -143,3 +143,31 @@ try:
     XUNRONGBAO_SHIPPING_PREMIUM_PER_TON = float(_xrb)
 except ValueError:
     XUNRONGBAO_SHIPPING_PREMIUM_PER_TON = 80.0
+
+
+def _parse_csv_positive_ints(raw: str) -> FrozenSet[int]:
+    out: set[int] = set()
+    for part in (raw or "").split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            v = int(s)
+            if v > 0:
+                out.add(v)
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+def _parse_csv_names(raw: str) -> Tuple[str, ...]:
+    return tuple(p.strip() for p in (raw or "").split(",") if p.strip())
+
+
+# 垂直库房 AI 分析：竞品库房类型（dict_warehouse_types.id）；名称在运行时查库解析
+VERTICAL_WAREHOUSE_AI_COMPETITOR_TYPE_IDS: FrozenSet[int] = _parse_csv_positive_ints(
+    os.getenv("VERTICAL_WAREHOUSE_AI_COMPETITOR_TYPE_IDS", "")
+)
+VERTICAL_WAREHOUSE_AI_COMPETITOR_TYPE_NAMES: Tuple[str, ...] = _parse_csv_names(
+    os.getenv("VERTICAL_WAREHOUSE_AI_COMPETITOR_TYPE_NAMES", "")
+)

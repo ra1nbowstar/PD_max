@@ -460,12 +460,18 @@ TABLE_STATEMENTS = [
         benchmark_city VARCHAR(128) NOT NULL DEFAULT '' COMMENT '对标城市（人工配置）',
         city_spread DECIMAL(18, 4) NOT NULL DEFAULT 0.0000 COMMENT '对标城市差额（可负）',
         gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+        warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价（Excel定价列等人工录入）',
+        link_warehouse_id INT DEFAULT NULL COMMENT '用于计算实时价差的绑定对标库房ID',
+        link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
             ON UPDATE CASCADE ON DELETE CASCADE,
+        CONSTRAINT fk_wsc_link_wh FOREIGN KEY (link_warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE SET NULL,
         UNIQUE KEY uk_wsc_warehouse (warehouse_id),
-        INDEX idx_wsc_wh (warehouse_id)
+        INDEX idx_wsc_wh (warehouse_id),
+        INDEX idx_wsc_link_wh (link_warehouse_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房对标差额与毛利配置';
     """,
     # AI 定价对标分析快照头
@@ -504,6 +510,24 @@ TABLE_STATEMENTS = [
         INDEX idx_apsi_snapshot (snapshot_id),
         INDEX idx_apsi_wh (warehouse_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照明细';
+    """,
+    # 垂直库房 AI 定价分析快照（单源库房一次分析一条）
+    """
+    CREATE TABLE IF NOT EXISTS pd_vertical_warehouse_ai_snapshots (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse_id INT NOT NULL COMMENT '源库房ID',
+        warehouse_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '源库房名称',
+        title VARCHAR(255) DEFAULT NULL COMMENT '快照标题',
+        as_of_date DATE DEFAULT NULL COMMENT '口径日期',
+        input_context JSON DEFAULT NULL COMMENT '聚合分析上下文',
+        llm_result JSON DEFAULT NULL COMMENT '大模型三方面建议',
+        llm_model VARCHAR(128) DEFAULT NULL COMMENT '使用的模型名',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        CONSTRAINT fk_vwais_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE RESTRICT,
+        INDEX idx_vwais_wh (warehouse_id),
+        INDEX idx_vwais_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='垂直库房AI定价分析快照';
     """,
 ]
 
@@ -1148,6 +1172,9 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                     benchmark_city VARCHAR(128) NOT NULL DEFAULT '' COMMENT '对标城市',
                     city_spread DECIMAL(18, 4) NOT NULL DEFAULT 0.0000 COMMENT '对标城市差额',
                     gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+                    warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价',
+                    link_warehouse_id INT DEFAULT NULL COMMENT '绑定对标库房ID',
+                    link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
@@ -1157,6 +1184,7 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房对标差额与毛利配置';
                 """
             )
+            _ensure_pd_warehouse_spread_config_columns(cursor)
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pd_ai_pricing_snapshots (
@@ -1194,6 +1222,25 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                     INDEX idx_apsi_snapshot (snapshot_id),
                     INDEX idx_apsi_wh (warehouse_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照明细';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_vertical_warehouse_ai_snapshots (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '源库房ID',
+                    warehouse_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '源库房名称',
+                    title VARCHAR(255) DEFAULT NULL COMMENT '快照标题',
+                    as_of_date DATE DEFAULT NULL COMMENT '口径日期',
+                    input_context JSON DEFAULT NULL COMMENT '聚合分析上下文',
+                    llm_result JSON DEFAULT NULL COMMENT '大模型三方面建议',
+                    llm_model VARCHAR(128) DEFAULT NULL COMMENT '使用的模型名',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    CONSTRAINT fk_vwais_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    INDEX idx_vwais_wh (warehouse_id),
+                    INDEX idx_vwais_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='垂直库房AI定价分析快照';
                 """
             )
         connection.commit()
@@ -1282,6 +1329,89 @@ def create_tables() -> None:
         ensure_pd_pricing_benchmark_tables()
     except Exception:
         logger.exception("检查/创建 pd_* 对标定价相关表失败")
+    try:
+        ensure_pd_warehouse_spread_config_price_columns()
+    except Exception:
+        logger.exception("检查/添加 pd_warehouse_spread_configs 库房定价与实时价差列失败")
+    try:
+        ensure_pd_vertical_warehouse_ai_snapshots_table()
+    except Exception:
+        logger.exception("检查/创建 pd_vertical_warehouse_ai_snapshots 表失败")
+
+
+def ensure_pd_vertical_warehouse_ai_snapshots_table() -> None:
+    """旧库补建垂直库房 AI 分析快照表。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_vertical_warehouse_ai_snapshots (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '源库房ID',
+                    warehouse_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '源库房名称',
+                    title VARCHAR(255) DEFAULT NULL COMMENT '快照标题',
+                    as_of_date DATE DEFAULT NULL COMMENT '口径日期',
+                    input_context JSON DEFAULT NULL COMMENT '聚合分析上下文',
+                    llm_result JSON DEFAULT NULL COMMENT '大模型三方面建议',
+                    llm_model VARCHAR(128) DEFAULT NULL COMMENT '使用的模型名',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    CONSTRAINT fk_vwais_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    INDEX idx_vwais_wh (warehouse_id),
+                    INDEX idx_vwais_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='垂直库房AI定价分析快照';
+                """
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _ensure_pd_warehouse_spread_config_columns(cursor) -> None:
+    """旧库补列：库房定价、绑定库房、实时价差（CREATE IF NOT EXISTS 不含新列时）。"""
+    cursor.execute("SHOW TABLES LIKE 'pd_warehouse_spread_configs'")
+    if cursor.fetchone() is None:
+        return
+    alters = [
+        (
+            "warehouse_price",
+            "ALTER TABLE pd_warehouse_spread_configs ADD COLUMN warehouse_price "
+            "DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价（Excel定价列等）' AFTER gross_margin_config",
+        ),
+        (
+            "link_warehouse_id",
+            "ALTER TABLE pd_warehouse_spread_configs ADD COLUMN link_warehouse_id INT DEFAULT NULL "
+            "COMMENT '绑定对标库房ID' AFTER warehouse_price",
+        ),
+        (
+            "link_realtime_spread",
+            "ALTER TABLE pd_warehouse_spread_configs ADD COLUMN link_realtime_spread "
+            "DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价' AFTER link_warehouse_id",
+        ),
+    ]
+    for col, ddl in alters:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE table_schema = DATABASE() AND table_name = 'pd_warehouse_spread_configs' "
+            "AND column_name = %s",
+            (col,),
+        )
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(ddl)
+            logger.info("已为 pd_warehouse_spread_configs 添加 %s 列", col)
+
+
+def ensure_pd_warehouse_spread_config_price_columns() -> None:
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            _ensure_pd_warehouse_spread_config_columns(cursor)
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def ensure_dict_warehouses_business_columns() -> None:

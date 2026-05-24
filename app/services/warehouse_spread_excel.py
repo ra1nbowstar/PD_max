@@ -78,6 +78,11 @@ def _resolve_col_index(headers: List[str], candidates: Tuple[str, ...]) -> Optio
     return None
 
 
+def _resolve_warehouse_price_col(headers: List[str]) -> Optional[int]:
+    """仅识别「定价/库房报价」列，不使用「标定价格」等列。"""
+    return _resolve_col_index(headers, _WAREHOUSE_PRICE_CANDIDATES)
+
+
 def _find_spread_col(headers: List[str]) -> Optional[int]:
     for i, h in enumerate(headers):
         nh = _norm_header(h)
@@ -238,7 +243,7 @@ def parse_warehouse_spread_workbook(content: bytes) -> Tuple[Dict[str, SpreadImp
                 continue
 
             gm_idx = _resolve_col_index(headers, _GROSS_MARGIN_CANDIDATES)
-            price_idx = _resolve_col_index(headers, _WAREHOUSE_PRICE_CANDIDATES)
+            price_idx = _resolve_warehouse_price_col(headers)
             region_idx = _resolve_col_index(headers, _REGION_CANDIDATES)
             spread_idx = _find_spread_col(headers)
             header_city = _benchmark_city_from_header(headers[spread_idx]) if spread_idx is not None else ""

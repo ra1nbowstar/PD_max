@@ -890,6 +890,7 @@ class WarehouseSpreadConfigCreate(BaseModel):
     对标城市: str = Field("", description="对标城市（人工配置）")
     对标城市差额: float = Field(0, description="可正可负")
     毛利配置版: Optional[float] = Field(None, description="毛利（配置版），可选")
+    库房定价: Optional[float] = Field(None, description="Excel「定价」列或人工录入的库房定价")
 
 
 class WarehouseSpreadConfigUpdate(BaseModel):
@@ -900,6 +901,7 @@ class WarehouseSpreadConfigUpdate(BaseModel):
     对标城市: Optional[str] = None
     对标城市差额: Optional[float] = None
     毛利配置版: Optional[float] = None
+    库房定价: Optional[float] = Field(None, description="库房定价；传空字符串可清空")
 
 
 class AiPricingSnapshotCreate(BaseModel):

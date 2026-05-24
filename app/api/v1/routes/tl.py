@@ -11,7 +11,8 @@ TL比价模块路由
   1c2.DELETE /tl/purge_warehouse        - 永久删除仓库（硬删除）
   1d.库房单向关联（有向图）：POST /tl/bind_warehouse_link、DELETE /tl/unbind_warehouse_link、
       POST /tl/batch_bind_warehouse_links、POST /tl/batch_unbind_warehouse_links、
-      GET /tl/get_warehouse_links_list、GET /tl/get_tier_price_spread_list（阶梯差价列表）、
+      GET /tl/get_warehouse_links_list、GET /tl/get_link_realtime_spread_list（实时价差列表）、
+      GET /tl/get_tier_price_spread_list（阶梯差价列表）、
       GET /tl/get_warehouse_links_outbound、GET /tl/get_warehouse_links_inbound、
       PUT /tl/replace_warehouse_links_outbound、PUT /tl/update_warehouse_link_tier
   1e.POST /tl/add_smelter              - 新建冶炼厂（可选循融宝发货，默认否）
@@ -646,6 +647,56 @@ def get_warehouse_links_list(
             to_warehouse_id=to_warehouse_id,
             keyword=keyword,
             has_tier_price_spread=has_tier_price_spread,
+        )
+    except ValueError as e:
+        raise _tl_value_error_http(e)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/get_link_realtime_spread_list", summary="查询库房关联实时价差列表")
+def get_link_realtime_spread_list(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    warehouse_id: Optional[int] = Query(
+        None,
+        description="涉及该库房 id 的关联（作为源或对标）；不传则不限定",
+    ),
+    from_warehouse_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="仅源库房 id 等于该值的边",
+    ),
+    to_warehouse_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="仅对标库房 id 等于该值的边",
+    ),
+    keyword: Optional[str] = Query(
+        None,
+        description="源或对标库房名称模糊匹配（可选）",
+    ),
+    has_realtime_spread: Optional[bool] = Query(
+        None,
+        description="true=源/对标库房均已配置库房定价并可计算价差；false=至少一方未配置定价；不传=全部",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """
+    分页返回各关联边上的源库房定价、对标库房定价及实时价差（源定价−对标定价）。
+    筛选条件与 get_warehouse_links_list / get_tier_price_spread_list 一致。
+    """
+    try:
+        return service.get_link_realtime_spread_list(
+            page=page,
+            size=size,
+            warehouse_id=warehouse_id,
+            from_warehouse_id=from_warehouse_id,
+            to_warehouse_id=to_warehouse_id,
+            keyword=keyword,
+            has_realtime_spread=has_realtime_spread,
         )
     except ValueError as e:
         raise _tl_value_error_http(e)
@@ -1959,6 +2010,7 @@ def warehouse_spread_configs_create(
             benchmark_city=body.对标城市,
             city_spread=body.对标城市差额,
             gross_margin_config=body.毛利配置版,
+            warehouse_price=body.库房定价,
         )
     except ValueError as e:
         if "已有配置" in str(e):
@@ -1981,6 +2033,7 @@ def warehouse_spread_configs_update(
             benchmark_city=patch.get("对标城市"),
             city_spread=patch.get("对标城市差额"),
             gross_margin_config=patch.get("毛利配置版"),
+            warehouse_price=patch.get("库房定价"),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

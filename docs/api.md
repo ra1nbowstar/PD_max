@@ -912,6 +912,10 @@ file: [报价单1.jpg]
 
 响应与其它 TL 接口一致时多为 `{ "code": 200, "data": ... }`；列表内含 `total`、`list`、`page` 等分页字段。数据库表说明见 **[数据库文档.md](./数据库文档.md)**。
 
+### 垂直库房 AI 定价分析（独立模块）
+
+前缀 **`/vertical-warehouse-ai`**（与 `/tl` 并列，见 [后端接口文档.md](./后端接口文档.md) 第 6 章）。实时分析：`GET /vertical-warehouse-ai/analysis?warehouse_id=`；快照 CRUD：`/vertical-warehouse-ai/snapshots`。
+
 ---
 
 ## 补充说明

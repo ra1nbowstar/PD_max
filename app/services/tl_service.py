@@ -13,7 +13,7 @@ from collections import OrderedDict
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import AbstractSet, Any, Dict, List, Optional, Set, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from pymysql.err import IntegrityError as PyMySQLIntegrityError
 
@@ -66,6 +66,7 @@ from app.services.tl_dict_geo_crud import (
     warehouse_links_batch_bind as sa_wh_links_batch_bind,
     warehouse_links_batch_unbind as sa_wh_links_batch_unbind,
     warehouse_links_list_all as sa_wh_links_list_all,
+    warehouse_links_realtime_spread_list as sa_wh_links_realtime_spread_list,
     warehouse_list as sa_wh_list,
     warehouse_update as sa_wh_update,
 )
@@ -1183,6 +1184,19 @@ class TLService:
         )
         payload = res.get("data") or {}
         raw_list = payload.get("list") or []
+        out_rows = self._warehouse_links_rows_to_tl(raw_list, include_prices=False)
+        return {
+            "code": 200,
+            "msg": "查询成功",
+            "list": out_rows,
+            "total": int(payload.get("total") or 0),
+            "page": int(payload.get("page") or page),
+            "size": int(payload.get("size") or size),
+        }
+
+    def _warehouse_links_rows_to_tl(
+        self, raw_list: List[Dict[str, Any]], *, include_prices: bool = False
+    ) -> List[Dict[str, Any]]:
         all_types: List[str] = []
         for it in raw_list:
             for side in ("source", "target"):
@@ -1212,18 +1226,48 @@ class TLService:
                 c = tcol.get(int(t_wt_id))
                 tgt_tl["库房类型颜色配置"] = c
                 tgt_tl["颜色配置"] = c
-            out_rows.append(
-                {
-                    "关联id": it.get("linkId"),
-                    "源库房id": it.get("fromWarehouseId"),
-                    "对标库房id": it.get("toWarehouseId"),
-                    "创建时间": it.get("createTime"),
-                    "距离千米": it.get("distanceKm"),
-                    "阶梯价差": it.get("tierPriceSpread"),
-                    "源库房": src_tl,
-                    "对标库房": tgt_tl,
-                }
+            row_out: Dict[str, Any] = {
+                "关联id": it.get("linkId"),
+                "源库房id": it.get("fromWarehouseId"),
+                "对标库房id": it.get("toWarehouseId"),
+                "创建时间": it.get("createTime"),
+                "距离千米": it.get("distanceKm"),
+                "阶梯价差": it.get("tierPriceSpread"),
+                "源库房": src_tl,
+                "对标库房": tgt_tl,
+            }
+            if include_prices:
+                row_out["源库房定价"] = it.get("fromWarehousePrice")
+                row_out["对标库房定价"] = it.get("toWarehousePrice")
+                row_out["实时价差"] = it.get("realtimeSpread")
+            out_rows.append(row_out)
+        return out_rows
+
+    def get_link_realtime_spread_list(
+        self,
+        page: int = 1,
+        size: int = 50,
+        warehouse_id: Optional[int] = None,
+        from_warehouse_id: Optional[int] = None,
+        to_warehouse_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+        has_realtime_spread: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """库房关联实时价差列表：每条出边返回源/对标库房定价及实时价差（源−对标）。"""
+        res = _raise_tl_geo_crud_result(
+            sa_wh_links_realtime_spread_list(
+                page=page,
+                size=size,
+                warehouse_id=warehouse_id,
+                from_warehouse_id=from_warehouse_id,
+                to_warehouse_id=to_warehouse_id,
+                keyword=keyword,
+                has_realtime_spread=has_realtime_spread,
             )
+        )
+        payload = res.get("data") or {}
+        raw_list = payload.get("list") or []
+        out_rows = self._warehouse_links_rows_to_tl(raw_list, include_prices=True)
         return {
             "code": 200,
             "msg": "查询成功",
@@ -5920,31 +5964,46 @@ class TLService:
         )
 
         cur.execute(
-            "SELECT benchmark_city, city_spread, gross_margin_config "
-            "FROM pd_warehouse_spread_configs WHERE warehouse_id = %s",
+            """
+            SELECT benchmark_city, city_spread, gross_margin_config, warehouse_price,
+                   link_warehouse_id, link_realtime_spread
+            FROM pd_warehouse_spread_configs WHERE warehouse_id = %s
+            """,
             (warehouse_id,),
         )
         cfg = cur.fetchone()
         cfg_benchmark_city = None
         spread_dec: Optional[Decimal] = None
         gmc: Optional[Decimal] = None
+        cfg_wh_price: Optional[Decimal] = None
+        link_wh_id: Optional[int] = None
+        link_rt_spread: Optional[Decimal] = None
         if cfg:
             cfg_benchmark_city = (cfg[0] or "").strip() or None
             spread_dec = Decimal(str(cfg[1])) if cfg[1] is not None else None
             gmc = Decimal(str(cfg[2])) if cfg[2] is not None else None
+            cfg_wh_price = Decimal(str(cfg[3])) if cfg[3] is not None else None
+            link_wh_id = int(cfg[4]) if cfg[4] is not None else None
+            link_rt_spread = Decimal(str(cfg[5])) if cfg[5] is not None else None
 
         display_benchmark_city = cfg_benchmark_city or bench_city_p
 
         cal_price = self._latest_smelter_calibration_price(cur, jinli_id, as_of)
         freight = self._resolve_freight_jinli_warehouse(cur, jinli_id, warehouse_id, as_of)
 
-        wh_price: Optional[Decimal] = None
-        if bench_price is not None and spread_dec is not None:
+        wh_price: Optional[Decimal] = cfg_wh_price
+        if wh_price is None and bench_price is not None and spread_dec is not None:
             wh_price = bench_price + spread_dec
 
         gm_comp: Optional[Decimal] = None
         if cal_price is not None and freight is not None and wh_price is not None:
             gm_comp = cal_price - freight - wh_price
+
+        link_wh_name = ""
+        if link_wh_id:
+            cur.execute("SELECT name FROM dict_warehouses WHERE id = %s", (link_wh_id,))
+            ln = cur.fetchone()
+            link_wh_name = (ln[0] or "") if ln else ""
 
         return {
             "库房id": warehouse_id,
@@ -5958,6 +6017,10 @@ class TLService:
             "对标城市差额": spread_dec,
             "毛利（配置版）": gmc,
             "库房定价": wh_price,
+            "库房定价（配置录入）": cfg_wh_price,
+            "绑定库房id": link_wh_id,
+            "绑定库房名称": link_wh_name,
+            "实时价差": link_rt_spread,
             "毛利（计算版）": gm_comp,
             "对标城市定价": bench_price,
         }
@@ -5996,6 +6059,10 @@ class TLService:
             "对标城市差额": _cell_json(raw["对标城市差额"]),
             "毛利（配置版）": _cell_json(raw["毛利（配置版）"]),
             "库房定价": _cell_json(raw["库房定价"]),
+            "库房定价（配置录入）": _cell_json(raw.get("库房定价（配置录入）")),
+            "绑定库房id": raw.get("绑定库房id"),
+            "绑定库房名称": raw.get("绑定库房名称") or "",
+            "实时价差": _cell_json(raw.get("实时价差")),
             "毛利（计算版）": _cell_json(raw["毛利（计算版）"]),
             "对标城市定价": _cell_json(raw["对标城市定价"]),
         }
@@ -6586,6 +6653,7 @@ class TLService:
         base = (
             "FROM pd_warehouse_spread_configs wsc "
             "JOIN dict_warehouses dw ON dw.id = wsc.warehouse_id "
+            "LEFT JOIN dict_warehouses dw_link ON dw_link.id = wsc.link_warehouse_id "
             f"WHERE {where_sql}"
         )
         with get_conn() as conn:
@@ -6596,7 +6664,8 @@ class TLService:
                     f"""
                     SELECT wsc.id, wsc.warehouse_id, dw.name, dw.province, dw.city,
                            wsc.benchmark_city, wsc.city_spread, wsc.gross_margin_config,
-                           wsc.created_at, wsc.updated_at
+                           wsc.warehouse_price, wsc.link_warehouse_id, dw_link.name,
+                           wsc.link_realtime_spread, wsc.created_at, wsc.updated_at
                     {base}
                     ORDER BY wsc.id DESC
                     LIMIT %s OFFSET %s
@@ -6615,8 +6684,12 @@ class TLService:
                             "对标城市": r[5] or "",
                             "对标城市差额": _cell_json(r[6]),
                             "毛利（配置版）": _cell_json(r[7]),
-                            "创建时间": r[8].isoformat() if r[8] else None,
-                            "更新时间": r[9].isoformat() if r[9] else None,
+                            "库房定价": _cell_json(r[8]),
+                            "绑定库房id": r[9],
+                            "绑定库房名称": r[10] or "",
+                            "实时价差": _cell_json(r[11]),
+                            "创建时间": r[12].isoformat() if r[12] else None,
+                            "更新时间": r[13].isoformat() if r[13] else None,
                         }
                     )
         return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
@@ -6628,6 +6701,7 @@ class TLService:
         benchmark_city: str,
         city_spread: Any,
         gross_margin_config: Optional[Any] = None,
+        warehouse_price: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if warehouse_id < 1:
             raise ValueError("库房 id 无效")
@@ -6636,6 +6710,9 @@ class TLService:
         gmc = None
         if gross_margin_config is not None and str(gross_margin_config).strip() != "":
             gmc = Decimal(str(gross_margin_config))
+        whp = None
+        if warehouse_price is not None and str(warehouse_price).strip() != "":
+            whp = Decimal(str(warehouse_price))
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM dict_warehouses WHERE id = %s", (warehouse_id,))
@@ -6645,12 +6722,13 @@ class TLService:
                     cur.execute(
                         """
                         INSERT INTO pd_warehouse_spread_configs
-                        (warehouse_id, benchmark_city, city_spread, gross_margin_config)
-                        VALUES (%s, %s, %s, %s)
+                        (warehouse_id, benchmark_city, city_spread, gross_margin_config, warehouse_price)
+                        VALUES (%s, %s, %s, %s, %s)
                         """,
-                        (warehouse_id, bc, sp, gmc),
+                        (warehouse_id, bc, sp, gmc, whp),
                     )
                     new_id = cur.lastrowid
+                    self._recompute_link_realtime_spreads(cur, [warehouse_id])
                 except PyMySQLIntegrityError:
                     raise ValueError("该库房已有配置，请使用更新接口") from None
         return {"code": 200, "msg": "已新增库房差额配置", "data": {"id": new_id}}
@@ -6662,6 +6740,7 @@ class TLService:
         benchmark_city: Optional[str] = None,
         city_spread: Any = None,
         gross_margin_config: Any = None,
+        warehouse_price: Any = None,
     ) -> Dict[str, Any]:
         if config_id < 1:
             raise ValueError("id 无效")
@@ -6680,17 +6759,31 @@ class TLService:
             else:
                 updates.append("gross_margin_config = %s")
                 params.append(Decimal(str(gross_margin_config)))
+        if warehouse_price is not None:
+            if str(warehouse_price).strip() == "":
+                updates.append("warehouse_price = %s")
+                params.append(None)
+            else:
+                updates.append("warehouse_price = %s")
+                params.append(Decimal(str(warehouse_price)))
         if not updates:
             raise ValueError("无修改字段")
         params.append(config_id)
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
+                    "SELECT warehouse_id FROM pd_warehouse_spread_configs WHERE id = %s",
+                    (config_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("记录不存在")
+                wh_id = int(row[0])
+                cur.execute(
                     f"UPDATE pd_warehouse_spread_configs SET {', '.join(updates)} WHERE id = %s",
                     tuple(params),
                 )
-                if cur.rowcount == 0:
-                    raise ValueError("记录不存在")
+                self._recompute_link_realtime_spreads(cur, [wh_id])
         return {"code": 200, "msg": "已更新库房差额配置"}
 
     def delete_warehouse_spread_config(self, config_id: int) -> Dict[str, Any]:
@@ -6813,6 +6906,90 @@ class TLService:
             return None, "ambiguous"
         return None, "missing"
 
+    def _load_warehouse_price_map(self, cur) -> Dict[int, Decimal]:
+        cur.execute(
+            "SELECT warehouse_id, warehouse_price FROM pd_warehouse_spread_configs "
+            "WHERE warehouse_price IS NOT NULL"
+        )
+        out: Dict[int, Decimal] = {}
+        for wid, price in cur.fetchall():
+            if wid is not None and price is not None:
+                out[int(wid)] = Decimal(str(price))
+        return out
+
+    def _recompute_link_realtime_spreads(
+        self, cur, warehouse_ids: Optional[Iterable[int]] = None
+    ) -> int:
+        """
+        源库房与出边绑定对标库房均存在库房定价时：实时价差 = 源定价 - 对标定价。
+        多条出边时取 link id 最小且对标库房有定价的一条。
+        """
+        price_map = self._load_warehouse_price_map(cur)
+        if not price_map:
+            cur.execute(
+                "UPDATE pd_warehouse_spread_configs "
+                "SET link_warehouse_id = NULL, link_realtime_spread = NULL"
+            )
+            return cur.rowcount
+
+        scope_ids: Optional[Set[int]] = None
+        if warehouse_ids is not None:
+            scope_ids = {int(x) for x in warehouse_ids if x is not None}
+            if not scope_ids:
+                return 0
+            extra: Set[int] = set(scope_ids)
+            ph = ",".join(["%s"] * len(scope_ids))
+            cur.execute(
+                f"""
+                SELECT from_warehouse_id, to_warehouse_id
+                FROM dict_warehouse_links
+                WHERE from_warehouse_id IN ({ph}) OR to_warehouse_id IN ({ph})
+                """,
+                tuple(scope_ids) + tuple(scope_ids),
+            )
+            for from_id, to_id in cur.fetchall():
+                extra.add(int(from_id))
+                extra.add(int(to_id))
+            scope_ids = extra
+
+        cur.execute(
+            "SELECT from_warehouse_id, to_warehouse_id, id "
+            "FROM dict_warehouse_links ORDER BY id ASC"
+        )
+        links_by_from: Dict[int, List[int]] = {}
+        for from_id, to_id, _link_id in cur.fetchall():
+            links_by_from.setdefault(int(from_id), []).append(int(to_id))
+
+        if scope_ids is not None:
+            target_wids = scope_ids
+        else:
+            cur.execute("SELECT warehouse_id FROM pd_warehouse_spread_configs")
+            target_wids = {int(r[0]) for r in cur.fetchall()}
+
+        updated = 0
+        for from_id in target_wids:
+            self_price = price_map.get(from_id)
+            link_to: Optional[int] = None
+            link_spread: Optional[Decimal] = None
+            if self_price is not None:
+                for to_id in links_by_from.get(from_id, []):
+                    to_price = price_map.get(to_id)
+                    if to_price is not None:
+                        link_to = to_id
+                        link_spread = self_price - to_price
+                        break
+            cur.execute(
+                """
+                UPDATE pd_warehouse_spread_configs
+                SET link_warehouse_id = %s, link_realtime_spread = %s
+                WHERE warehouse_id = %s
+                """,
+                (link_to, link_spread, from_id),
+            )
+            if cur.rowcount:
+                updated += 1
+        return updated
+
     def _finalize_spread_import_row(
         self,
         cur,
@@ -6835,7 +7012,12 @@ class TLService:
                 if not benchmark_city:
                     benchmark_city = (bench.get("benchmark_city") or "").strip()
 
-        if city_spread is None and gross_margin is None and not benchmark_city:
+        if (
+            city_spread is None
+            and gross_margin is None
+            and not benchmark_city
+            and row.warehouse_price is None
+        ):
             return None
 
         return SpreadImportRow(
@@ -6876,6 +7058,7 @@ class TLService:
         }
         errors: List[str] = []
         samples: List[Dict[str, Any]] = []
+        affected_wh_ids: List[int] = []
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -6907,8 +7090,10 @@ class TLService:
                         continue
 
                     cur.execute(
-                        "SELECT id, benchmark_city, city_spread, gross_margin_config "
-                        "FROM pd_warehouse_spread_configs WHERE warehouse_id = %s",
+                        """
+                        SELECT id, benchmark_city, city_spread, gross_margin_config, warehouse_price
+                        FROM pd_warehouse_spread_configs WHERE warehouse_id = %s
+                        """,
                         (wid,),
                     )
                     existing = cur.fetchone()
@@ -6920,6 +7105,7 @@ class TLService:
                     benchmark_city = (finalized.benchmark_city or "").strip()
                     city_spread = finalized.city_spread
                     gross_margin = finalized.gross_margin_config
+                    wh_price = finalized.warehouse_price
 
                     if existing:
                         cfg_id = int(existing[0])
@@ -6934,6 +7120,9 @@ class TLService:
                         if gross_margin is not None:
                             updates.append("gross_margin_config = %s")
                             params.append(gross_margin)
+                        if wh_price is not None:
+                            updates.append("warehouse_price = %s")
+                            params.append(wh_price)
                         if not updates:
                             stats["skipped_no_data"] += 1
                             continue
@@ -6948,18 +7137,21 @@ class TLService:
                         cur.execute(
                             """
                             INSERT INTO pd_warehouse_spread_configs
-                            (warehouse_id, benchmark_city, city_spread, gross_margin_config)
-                            VALUES (%s, %s, %s, %s)
+                            (warehouse_id, benchmark_city, city_spread, gross_margin_config, warehouse_price)
+                            VALUES (%s, %s, %s, %s, %s)
                             """,
                             (
                                 wid,
                                 benchmark_city,
                                 city_spread if city_spread is not None else Decimal("0"),
                                 gross_margin,
+                                wh_price,
                             ),
                         )
                         stats["inserted"] += 1
                         action = "inserted"
+
+                    affected_wh_ids.append(wid)
 
                     if len(samples) < 20:
                         samples.append(
@@ -6972,8 +7164,14 @@ class TLService:
                                 "对标城市": benchmark_city or None,
                                 "对标城市差额": _cell_json(city_spread),
                                 "毛利（配置版）": _cell_json(gross_margin),
+                                "库房定价": _cell_json(wh_price),
                             }
                         )
+
+                if affected_wh_ids:
+                    stats["link_spread_recomputed"] = self._recompute_link_realtime_spreads(
+                        cur, affected_wh_ids
+                    )
 
         sheets_out = []
         for s in sheet_summaries:
