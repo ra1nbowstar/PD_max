@@ -418,6 +418,10 @@ class DetectionDomainServiceV3:
     ):
         self.registry = registry
         self.semaphore = semaphore
+        self._cached_img_cv2: Optional[np.ndarray] = None
+        self._cached_tokens: Optional[List[Any]] = None
+        self._cached_candidates: Optional[List[Any]] = None
+        self._ocr_reader: Optional[Any] = None
 
     @staticmethod
     def _bbox_iou(a: BBoxDTO, b: BBoxDTO) -> float:
@@ -463,22 +467,25 @@ class DetectionDomainServiceV3:
         task = await self.registry.get_task(task_id)
         return bool(not task or task.status == TaskStatusEnum.CANCELED)
 
-    @staticmethod
-    def _easyocr_auto_detect(image_path: str, ocr_reader: Any) -> List[BBoxDTO]:
+    def _run_ocr_once(self, image_path: str, ocr_reader: Any) -> None:
+        """读取图片并执行一次 OCR tokenize + amount 候选构建，结果缓存供后续复用。"""
+        if self._cached_tokens is not None:
+            return
         img_cv2 = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img_cv2 is None:
-            return []
-
+            return
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
         blurred = cv2.medianBlur(gray, 3)
+        ocr_results = ocr_reader.readtext(blurred, adjust_contrast=0.5, mag_ratio=2.0, text_threshold=0.25)
+        self._cached_img_cv2 = img_cv2
+        self._cached_tokens = tokenize_ocr_results(ocr_results)
+        self._cached_candidates = build_amount_candidates(self._cached_tokens, img_cv2.shape)
+        self._ocr_reader = ocr_reader
 
-        ocr_results = ocr_reader.readtext(
-            blurred,
-            adjust_contrast=0.5,
-            mag_ratio=2.0,
-            text_threshold=0.25,
-        )
-
+    def _easyocr_auto_detect(self, image_path: str) -> List[BBoxDTO]:
+        _ = image_path
+        if not self._cached_candidates:
+            return []
         return [
             BBoxDTO(
                 x1=int(candidate.bbox[0]),
@@ -486,31 +493,19 @@ class DetectionDomainServiceV3:
                 x2=int(candidate.bbox[2]),
                 y2=int(candidate.bbox[3]),
             )
-            for candidate in build_amount_candidates(tokenize_ocr_results(ocr_results), img_cv2.shape)
+            for candidate in self._cached_candidates
         ]
 
-    @staticmethod
-    def _document_rule_override(image_path: str, ocr_reader: Any) -> Optional[Dict[str, Any]]:
-        img_cv2 = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if img_cv2 is None:
+    def _document_rule_override(self, image_path: str) -> Optional[Dict[str, Any]]:
+        if self._cached_img_cv2 is None or not self._cached_tokens:
             return None
 
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.medianBlur(gray, 3)
-        ocr_results = ocr_reader.readtext(
-            blurred,
-            adjust_contrast=0.5,
-            mag_ratio=2.0,
-            text_threshold=0.25,
-        )
-        tokens = tokenize_ocr_results(ocr_results)
-        candidates = build_amount_candidates(tokens, img_cv2.shape)
         override = detect_certificate_document_override(
             image_path=Path(image_path),
-            image=img_cv2,
-            tokens=tokens,
-            candidates=candidates,
-            ocr_reader=ocr_reader,
+            image=self._cached_img_cv2,
+            tokens=self._cached_tokens,
+            candidates=self._cached_candidates or [],
+            ocr_reader=self._ocr_reader,
         )
         if not override:
             return None
@@ -570,14 +565,15 @@ class DetectionDomainServiceV3:
                 return
 
             async with self.semaphore:
-                bboxes = await run_in_threadpool(self._easyocr_auto_detect, image_path, ocr_reader)
+                await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
+                bboxes = await run_in_threadpool(self._easyocr_auto_detect, image_path)
             if await self._is_canceled(task_id):
                 return
             bboxes = self._deduplicate_bboxes(bboxes)
 
             if not bboxes:
                 async with self.semaphore:
-                    document_override = await run_in_threadpool(self._document_rule_override, image_path, ocr_reader)
+                    document_override = await run_in_threadpool(self._document_rule_override, image_path)
                 if await self._is_canceled(task_id):
                     return
 
@@ -630,7 +626,7 @@ class DetectionDomainServiceV3:
                     logger.warning("Task %s single bbox failed: %s", task_id, exc)
 
             async with self.semaphore:
-                document_override = await run_in_threadpool(self._document_rule_override, image_path, ocr_reader)
+                document_override = await run_in_threadpool(self._document_rule_override, image_path)
             if await self._is_canceled(task_id):
                 return
             if document_override and not any(item.get("result") == "篡改" for item in all_results):
