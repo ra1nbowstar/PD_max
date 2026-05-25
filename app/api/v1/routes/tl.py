@@ -2133,9 +2133,6 @@ def ai_pricing_analysis(
         None,
         description="true=仅已有差额配置；false=仅未配置；不传不限定",
     ),
-    province: Optional[str] = Query(None, description="省（精确匹配 dict_warehouses.province）"),
-    city: Optional[str] = Query(None, description="市（精确匹配 dict_warehouses.city）"),
-    district: Optional[str] = Query(None, description="区（精确匹配 dict_warehouses.district）"),
     service: TLService = Depends(get_tl_service),
 ):
     try:
@@ -2164,9 +2161,6 @@ def ai_pricing_analysis(
             has_gross_margin=has_gross_margin,
             has_spread_config=has_spread_config,
             as_of_date=as_of_date,
-            province=province,
-            city=city,
-            district=district,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
