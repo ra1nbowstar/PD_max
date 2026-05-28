@@ -20,12 +20,27 @@ weights:
   core_pixel: 0.60               # 核心字段：像素异常的权重
   core_font: 0.40                # 核心字段：字体异常的权重
   non_core_pixel: 0.80           # 非核心字段：纯像素异常的权重
+  pixel_overlap: 0.30            # 像素重叠/接缝检测权重
 
 # 【更新】全局阈值控制中心
 thresholds:
   global_fake: 0.65              # 全局大模型风险 > 此值，判定排版异常
   pixel_anomaly_alert: 0.60      # 局部像素风险 > 此值，触发拼接涂抹报警
+  pixel_overlap_alert: 0.55      # 像素重叠风险 > 此值，触发重叠/拼接报警
   exempt_pixel_safe: 0.40        # 非核心字段的像素风险 < 此值，直接豁免清零
 
   suspect_high: 0.65             # 综合风险率 > 此值，最终定性为“篡改”
   suspect_low: 0.50              # 综合风险率 > 此值，最终定性为“可疑”
+
+  timestamp_mismatch_risk: 0.58  # 时间不一致时的风险分
+  timestamp_future_risk: 0.72    # 未来时间时的风险分
+  timestamp_software_risk: 0.85  # EXIF 修图软件标记风险分
+  timestamp_business_mismatch_risk: 0.80  # 业务单据时间与图内时间不一致
+  business_time_tolerance_seconds: 300   # 单据时间与图内交易时间允许偏差（秒）
+  pixel_overlap_hard_tamper: 0.72        # 像素重叠分 >= 此值直接判篡改
+  hard_tamper_anomalies:                 # 出现即直接判篡改的时间异常码
+    - exif_editing_software
+    - future_datetime
+    - status_transaction_time_mismatch
+    - exif_visible_datetime_mismatch
+    - business_visible_datetime_mismatch

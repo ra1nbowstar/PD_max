@@ -1,0 +1,133 @@
+import unittest
+from datetime import datetime
+from unittest.mock import patch
+
+from app.ai_detection.amount_candidates import OCRToken
+from app.ai_detection.timestamp_checker import (
+    check_image_timestamps,
+    extract_timestamps_from_tokens,
+    parse_exif_timestamps,
+)
+
+
+class TimestampCheckerTests(unittest.TestCase):
+    def test_extract_status_bar_and_transaction_time(self):
+        tokens = [
+            OCRToken(
+                text="11:32",
+                clean_text="11:32",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+            OCRToken(
+                text="2026-05-28 11:32:00",
+                clean_text="2026-05-28 11:32:00",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        info = extract_timestamps_from_tokens(tokens, (1000, 800, 3))
+
+        self.assertEqual(info["status_bar_time"], "11:32")
+        self.assertEqual(info["transaction_time"], "2026-05-28 11:32:00")
+        self.assertEqual(info["transaction_datetime"], "2026-05-28 11:32:00")
+
+    def test_detects_status_transaction_mismatch(self):
+        tokens = [
+            OCRToken(
+                text="09:15",
+                clean_text="09:15",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+            OCRToken(
+                text="2026-05-28 18:40:00",
+                clean_text="2026-05-28 18:40:00",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+            )
+
+        self.assertIn("status_transaction_time_mismatch", result["anomalies"])
+        self.assertGreater(result["risk"], 0.5)
+        self.assertTrue(result.get("hard_tamper"))
+        self.assertTrue(any("状态栏时间" in reason for reason in result["reasons"]))
+
+    def test_detects_business_document_time_mismatch(self):
+        tokens = [
+            OCRToken(
+                text="2026-05-28 11:32:00",
+                clean_text="2026-05-28 11:32:00",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+                business_datetime="2026-05-28 18:40:00",
+            )
+
+        self.assertIn("business_visible_datetime_mismatch", result["anomalies"])
+        self.assertTrue(result.get("hard_tamper"))
+
+    @patch("app.ai_detection.timestamp_checker.Image.open")
+    def test_parse_exif_timestamps(self, mock_open):
+        mock_img = mock_open.return_value.__enter__.return_value
+        mock_img._getexif.return_value = {
+            36867: "2026:05:28 10:00:00",
+            36868: "2026:05:28 10:00:01",
+            305: "Adobe Photoshop",
+        }
+
+        info = parse_exif_timestamps("/tmp/mock-with-exif.jpg")
+
+        self.assertTrue(info["has_exif"])
+        self.assertEqual(info["datetime_original"], "2026-05-28 10:00:00")
+        self.assertTrue(info["suspicious_software"])
+
+    @patch("app.ai_detection.timestamp_checker.parse_exif_timestamps")
+    def test_future_datetime_is_flagged(self, mock_parse_exif):
+        future = datetime(2099, 1, 1, 12, 0, 0).isoformat(sep=" ", timespec="seconds")
+        mock_parse_exif.return_value = {
+            "has_exif": True,
+            "datetime_original": future,
+            "datetime_digitized": None,
+            "software": None,
+            "suspicious_software": False,
+        }
+
+        result = check_image_timestamps("/tmp/mock.jpg")
+
+        self.assertIn("future_datetime", result["anomalies"])
+        self.assertGreaterEqual(result["risk"], 0.72)
+
+
+if __name__ == "__main__":
+    unittest.main()
