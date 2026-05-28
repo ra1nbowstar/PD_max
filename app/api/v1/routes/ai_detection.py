@@ -27,7 +27,6 @@ from PIL import Image, ImageDraw
 from app.ai_detection.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
-    tokenize_ocr_results,
 )
 from app.ai_detection.core.utils import load_chinese_font
 from app.config import UPLOAD_DIR
@@ -40,6 +39,7 @@ from app.ai_detection.history_db import (
     list_ai_detection_history,
     purge_ai_detection_history_older_than,
 )
+from app.ai_detection.ocr_utils import run_full_image_ocr
 from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 
 if TYPE_CHECKING:
@@ -385,8 +385,10 @@ class DetectionService:
         bbox_list: List[int],
         engine: InferenceEngineAPI,
         semaphore: asyncio.Semaphore,
+        ocr_reader: Any,
         *,
         retain_temp_for_history: bool = False,
+        business_datetime: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """成功时若 retain_temp_for_history=True，返回 (结果, 临时图路径)，由调用方在归档后删除临时文件。"""
         tmp_path: Optional[str] = None
@@ -397,7 +399,17 @@ class DetectionService:
                 tmp_path = tmp.name
 
             async with semaphore:
-                result_str = await run_in_threadpool(engine.predict, tmp_path, bbox_list, "xyxy")
+                _, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                result_str = await run_in_threadpool(
+                    partial(
+                        engine.predict,
+                        tmp_path,
+                        bbox_list,
+                        "xyxy",
+                        ocr_tokens=ocr_tokens or None,
+                        business_datetime=business_datetime,
+                    ),
+                )
 
             result_dict = json.loads(result_str)
             if result_dict.get("result") == "错误":
@@ -471,16 +483,19 @@ class DetectionDomainServiceV3:
         """读取图片并执行一次 OCR tokenize + amount 候选构建，结果缓存供后续复用。"""
         if self._cached_tokens is not None:
             return
-        img_cv2 = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        img_cv2, tokens = run_full_image_ocr(image_path, ocr_reader)
         if img_cv2 is None:
             return
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.medianBlur(gray, 3)
-        ocr_results = ocr_reader.readtext(blurred, adjust_contrast=0.5, mag_ratio=2.0, text_threshold=0.25)
         self._cached_img_cv2 = img_cv2
-        self._cached_tokens = tokenize_ocr_results(ocr_results)
+        self._cached_tokens = tokens
         self._cached_candidates = build_amount_candidates(self._cached_tokens, img_cv2.shape)
         self._ocr_reader = ocr_reader
+
+    def _predict_kwargs(self, business_datetime: Optional[str]) -> Dict[str, Any]:
+        return {
+            "ocr_tokens": self._cached_tokens,
+            "business_datetime": business_datetime,
+        }
 
     def _easyocr_auto_detect(self, image_path: str) -> List[BBoxDTO]:
         _ = image_path
@@ -524,7 +539,13 @@ class DetectionDomainServiceV3:
             "amount_score": override.get("amount_score"),
         }
 
-    async def execute_async(self, task_id: str, image_path: str, bbox: Optional[BBoxDTO] = None) -> None:
+    async def execute_async(
+        self,
+        task_id: str,
+        image_path: str,
+        bbox: Optional[BBoxDTO] = None,
+        business_datetime: Optional[str] = None,
+    ) -> None:
         task = await self.registry.get_task(task_id)
         if not task or task.status == TaskStatusEnum.CANCELED:
             return
@@ -541,10 +562,16 @@ class DetectionDomainServiceV3:
             if await self._is_canceled(task_id):
                 return
 
+            async with self.semaphore:
+                await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
+            predict_extra = self._predict_kwargs(business_datetime)
+
             if bbox:
                 bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
                 async with self.semaphore:
-                    res_str = await run_in_threadpool(engine.predict, image_path, bbox_list, "xyxy")
+                    res_str = await run_in_threadpool(
+                        partial(engine.predict, image_path, bbox_list, "xyxy", **predict_extra),
+                    )
                 if await self._is_canceled(task_id):
                     return
 
@@ -565,7 +592,6 @@ class DetectionDomainServiceV3:
                 return
 
             async with self.semaphore:
-                await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
                 bboxes = await run_in_threadpool(self._easyocr_auto_detect, image_path)
             if await self._is_canceled(task_id):
                 return
@@ -614,7 +640,9 @@ class DetectionDomainServiceV3:
                 try:
                     b_list = [b.x1, b.y1, b.x2, b.y2]
                     async with self.semaphore:
-                        res_str = await run_in_threadpool(engine.predict, image_path, b_list, "xyxy")
+                        res_str = await run_in_threadpool(
+                            partial(engine.predict, image_path, b_list, "xyxy", **predict_extra),
+                        )
                     if await self._is_canceled(task_id):
                         return
 
@@ -783,12 +811,24 @@ _DETECT_RESULT_SCHEMA = (
     '  "result": "正常",\n'
     '  "confidence": 0.32,\n'
     '  "bbox": [120, 80, 280, 60],\n'
-    '  "reason": "未检出明显篡改痕迹"\n'
+    '  "reason": "未检出明显篡改痕迹",\n'
+    '  "pixel_overlap_score": 0.18,\n'
+    '  "timestamp_check": {\n'
+    '    "status_bar_time": "11:32",\n'
+    '    "transaction_time": "2026-05-28 11:32:00",\n'
+    '    "business_document_time": "2026-05-28 11:32:00",\n'
+    '    "exif_datetime_original": null,\n'
+    '    "anomalies": []\n'
+    "  },\n"
+    '  "hard_tamper_flags": { "pixel_overlap": false, "timestamp": false }\n'
     "}\n"
     "```\n"
     "- **result**：`正常` | `可疑` | `篡改` | `错误`\n"
     "- **confidence**：综合风险 0~1，越高越可疑\n"
     "- **bbox**：引擎实际使用的 ROI（x, y, 宽, 高）\n"
+    "- **pixel_overlap_score**：拼接/贴图接缝像素重叠风险（0~1）\n"
+    "- **timestamp_check**：图内时间、EXIF、业务单据时间及异常码（供前端展示）\n"
+    "- **hard_tamper_flags**：像素重叠或时间戳是否触发直接判「篡改」\n"
     "- **reason**：中文简要说明；异步任务成功时可能另含 **original_bbox**（用户传入的四点框）\n"
 )
 
@@ -805,7 +845,8 @@ _DETECT_RESULT_SCHEMA = (
         "**输入参数**\n"
         "- **file**：图片文件（如 JPG/PNG）\n"
         "- **bbox**：字符串。支持 JSON 数组 `[x1,y1,x2,y2]` 或英文逗号分隔 `x1,y1,x2,y2`（均为像素，"
-        "左上角到右下角）\n\n"
+        "左上角到右下角）\n"
+        "- **document_time**（可选）：业务单据时间，如 `2026-05-28 11:32:00`，将与图内交易时间比对\n\n"
         "**输出说明**\n"
         "- 成功：`{ \"status\": \"success\", \"data\": { ...引擎结果... } }`\n"
         "- 业务失败（引擎报「错误」）：HTTP 422，`{ \"status\": \"error\", \"message\": \"...\" }`\n\n"
@@ -834,7 +875,13 @@ async def detect_tampering_endpoint(
         description="检测框：JSON 数组 [x1,y1,x2,y2] 或逗号分隔的四个整数",
         examples=["[120,80,400,140]", "120,80,400,140"],
     ),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间，将与 OCR 识别的图内交易时间比对",
+        examples=["2026-05-28 11:32:00"],
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     try:
@@ -852,7 +899,9 @@ async def detect_tampering_endpoint(
             [int(x) for x in bbox_parsed],
             engine,
             semaphore,
+            ocr_reader,
             retain_temp_for_history=True,
+            business_datetime=document_time,
         )
         try:
             await run_in_threadpool(
@@ -936,7 +985,8 @@ async def get_detection_history_image(record_id: int):
         "1. 上传 **file**：新建任务，自动生成 `task_id` 并保存图片。\n"
         "2. 仅传 **task_id**：对已有任务重新触发排队（一般与上传二选一）。\n\n"
         "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选图中疑似单号/金额等数字区域，"
-        "对每个框分别推理，结果在 `multi_results` 中。\n\n"
+        "对每个框分别推理，结果在 `multi_results` 中。\n"
+        "可选 **document_time**：业务单据时间，将与图内 OCR 交易时间及 EXIF 比对。\n\n"
         "**输出示例（受理成功）**\n"
         "```json\n"
         "{\n"
@@ -956,6 +1006,11 @@ async def submit_detection(
         None,
         description="可选。指定框 [x1,y1,x2,y2]；不传则自动 OCR 多框检测",
         examples=["[120,80,400,140]"],
+    ),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间，将与图内 OCR 交易时间及 EXIF 比对",
+        examples=["2026-05-28 11:32:00"],
     ),
     registry: AbstractTaskRegistry = Depends(get_registry),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -985,7 +1040,7 @@ async def submit_detection(
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING)
     service = DetectionDomainServiceV3(registry, semaphore)
-    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto)
+    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, document_time)
     return {"status": "pending", "task_id": task_id}
 
 

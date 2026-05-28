@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary, TamperAnalyzer
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
+from app.ai_detection.timestamp_checker import check_image_timestamps
 
 # 配置标准日志输出
 logging.basicConfig(
@@ -103,7 +104,14 @@ class InferenceEngineAPI:
             "should_use_font_signal": float(should_use_font_signal),
         }
 
-    def predict(self, full_image_path: str, roi_bbox: List[int], bbox_format: str = "auto") -> str:
+    def predict(
+        self,
+        full_image_path: str,
+        roi_bbox: List[int],
+        bbox_format: str = "auto",
+        ocr_tokens: Optional[List[Any]] = None,
+        business_datetime: Optional[str] = None,
+    ) -> str:
         # 【终极防御】用 Try-Except 包裹，防止任何内部错误导致后端服务崩溃
         try:
             reasons = []
@@ -129,6 +137,8 @@ class InferenceEngineAPI:
             thresh_exempt = thresh.get('exempt_pixel_safe', 0.40)
             thresh_high = thresh.get('suspect_high', 0.65)
             thresh_low = thresh.get('suspect_low', 0.50)
+            thresh_overlap_alert = thresh.get('pixel_overlap_alert', 0.55)
+            thresh_overlap_hard = thresh.get('pixel_overlap_hard_tamper', 0.72)
 
             # ================== BBox 严密越界保护 ==================
             x1, y1, x2, y2 = self._normalize_roi_bbox(roi_bbox, img_w, img_h, bbox_format)
@@ -160,7 +170,20 @@ class InferenceEngineAPI:
             font_anomaly = max(0.0, 1.0 - font_sim)
 
             pixel_anomaly = self.pixel_detector.detect(roi_img_expanded)
+            pixel_overlap_score = self.pixel_detector.detect_overlap(roi_img_expanded)
             geo_reasons, geo_penalty = TamperAnalyzer.check_internal_consistency(stats)
+
+            timestamp_result = check_image_timestamps(
+                full_image_path,
+                ocr_tokens=ocr_tokens,
+                image_shape=(img_h, img_w, img.shape[2] if len(img.shape) > 2 else 3),
+                business_datetime=business_datetime,
+                thresholds=thresh,
+            )
+            timestamp_risk = float(timestamp_result.get("risk", 0.0))
+            timestamp_hard_tamper = bool(timestamp_result.get("hard_tamper"))
+            overlap_risk = pixel_overlap_score * weights.get('pixel_overlap', 0.30)
+            overlap_hard_tamper = pixel_overlap_score >= float(thresh_overlap_hard)
 
             # ================== 3. 自适应权重计算 ==================
             if should_use_font_signal and len(extracted_text) > 0:
@@ -177,7 +200,7 @@ class InferenceEngineAPI:
                 if pixel_anomaly < thresh_exempt and geo_penalty == 0:
                     local_tamper_prob = 0.0
 
-            final_risk = max(global_fake_prob, local_tamper_prob)
+            final_risk = max(global_fake_prob, local_tamper_prob, overlap_risk, timestamp_risk)
             final_risk = max(0.0, min(1.0, float(final_risk)))
 
             # ================== 4. 结果判定与防篡改理由梳理 ==================
@@ -185,12 +208,20 @@ class InferenceEngineAPI:
                 reasons.append("全局UI布局异常")
             if pixel_anomaly > thresh_pixel_alert:
                 reasons.append("存在局部边缘拼接/像素涂抹痕迹")
+            if pixel_overlap_score > thresh_overlap_alert:
+                reasons.append("检测到疑似像素重叠/拼接痕迹")
+            if timestamp_result.get("reasons"):
+                reasons.extend(timestamp_result["reasons"])
             if should_use_font_signal and font_anomaly > 0.55:
                 reasons.append("局部字体风格异常")
             if geo_penalty > 0:
                 reasons.extend(geo_reasons)
 
-            if final_risk > thresh_high:
+            force_tamper = timestamp_hard_tamper or overlap_hard_tamper
+            if force_tamper:
+                result_status = "篡改"
+                final_risk = max(final_risk, float(thresh_high) + 0.05)
+            elif final_risk > thresh_high:
                 result_status = "篡改"
             elif final_risk > thresh_low:
                 result_status = "可疑"
@@ -202,7 +233,13 @@ class InferenceEngineAPI:
                 "result": result_status,
                 "confidence": final_risk,
                 "bbox": [int(i) for i in [x, y, w, h]],
-                "reason": "；".join(reasons)
+                "reason": "；".join(dict.fromkeys(reasons)),
+                "pixel_overlap_score": round(float(pixel_overlap_score), 4),
+                "timestamp_check": timestamp_result.get("timestamp_check"),
+                "hard_tamper_flags": {
+                    "pixel_overlap": overlap_hard_tamper,
+                    "timestamp": timestamp_hard_tamper,
+                },
             }
             return json.dumps(output, ensure_ascii=False, indent=4, cls=NumpyEncoder)
 

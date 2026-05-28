@@ -63,6 +63,63 @@ class PixelLevelDetector:
         score = ela_score + edge_penalty + generator_penalty
         return float(min(1.0, score))
 
+    def detect_overlap(self, cropped_img_np, band_ratio=0.08, min_band=4):
+        """
+        检测 ROI 中心区域与边缘带之间的像素统计差异，以及投影方向上的突变线，
+        用于识别局部贴图/拼接导致的像素重叠或不连续。
+        """
+        if cropped_img_np is None or cropped_img_np.size == 0:
+            return 0.0
+
+        gray = cv2.cvtColor(cropped_img_np, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        h, w = gray.shape
+        if h < 24 or w < 24:
+            return 0.0
+
+        band_h = max(min_band, int(h * band_ratio))
+        band_w = max(min_band, int(w * band_ratio))
+
+        core = gray[band_h:-band_h, band_w:-band_w]
+        if core.size == 0:
+            return 0.0
+
+        core_var = float(np.var(core.astype(np.float64)))
+        core_mean = float(np.mean(core.astype(np.float64)))
+
+        bands = [
+            gray[:band_h, :],
+            gray[-band_h:, :],
+            gray[:, :band_w],
+            gray[:, -band_w:],
+        ]
+        band_scores = []
+        for band in bands:
+            if band.size == 0:
+                continue
+            band_var = float(np.var(band.astype(np.float64)))
+            band_mean = float(np.mean(band.astype(np.float64)))
+            var_ratio = abs(band_var - core_var) / (core_var + 1e-6)
+            mean_diff = abs(band_mean - core_mean) / 255.0
+            band_scores.append(min(1.0, var_ratio * 0.15 + mean_diff * 0.8))
+
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        seam_score = 0.0
+        h_proj = np.mean(np.abs(lap), axis=1)
+        v_proj = np.mean(np.abs(lap), axis=0)
+        if len(h_proj) > band_h * 2 + 4:
+            h_core = h_proj[band_h:-band_h]
+            h_peak = (float(np.max(h_core)) - float(np.mean(h_core))) / (float(np.std(h_core)) + 1e-6)
+            seam_score = max(seam_score, min(0.5, h_peak * 0.12))
+        if len(v_proj) > band_w * 2 + 4:
+            v_core = v_proj[band_w:-band_w]
+            v_peak = (float(np.max(v_core)) - float(np.mean(v_core))) / (float(np.std(v_core)) + 1e-6)
+            seam_score = max(seam_score, min(0.5, v_peak * 0.12))
+
+        edge_score = max(band_scores) if band_scores else 0.0
+        return float(min(1.0, edge_score * 0.65 + seam_score * 0.35))
+
+
 class OriginalityChecker:
     """原图与 EXIF 校验器"""
     def __init__(self, model_path=None):
