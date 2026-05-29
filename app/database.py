@@ -486,6 +486,23 @@ TABLE_STATEMENTS = [
         INDEX idx_scp_factory_date (factory_id, price_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂标定价格历史';
     """,
+    # SMM 1#铅锭公开页参考价（按定价日期唯一；均价=(最低+最高)/2）
+    """
+    CREATE TABLE IF NOT EXISTS pd_smm_lead_reference_prices (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        product_name VARCHAR(64) NOT NULL DEFAULT 'SMM 1#铅锭' COMMENT '品种名称',
+        price_low DECIMAL(18, 4) NOT NULL COMMENT '区间最低价',
+        price_high DECIMAL(18, 4) NOT NULL COMMENT '区间最高价',
+        average_price DECIMAL(18, 4) NOT NULL COMMENT '均价=(最低+最高)/2',
+        unit VARCHAR(16) NOT NULL DEFAULT '元/吨' COMMENT '单位',
+        quote_date DATE NOT NULL COMMENT '页面定价日期',
+        source_url VARCHAR(512) DEFAULT NULL COMMENT '抓取来源 URL',
+        fetched_at TIMESTAMP NULL DEFAULT NULL COMMENT '最近抓取时间',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+        UNIQUE KEY uk_slrp_quote_date (quote_date),
+        INDEX idx_slrp_quote_date (quote_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='SMM 1#铅锭公开页参考价历史';
+    """,
     # 库房对标城市差额与毛利（配置版），每库房一行
     """
     CREATE TABLE IF NOT EXISTS pd_warehouse_spread_configs (
@@ -1196,6 +1213,24 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                         ON UPDATE CASCADE ON DELETE RESTRICT,
                     INDEX idx_scp_factory_date (factory_id, price_date)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂标定价格历史';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_smm_lead_reference_prices (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    product_name VARCHAR(64) NOT NULL DEFAULT 'SMM 1#铅锭' COMMENT '品种名称',
+                    price_low DECIMAL(18, 4) NOT NULL COMMENT '区间最低价',
+                    price_high DECIMAL(18, 4) NOT NULL COMMENT '区间最高价',
+                    average_price DECIMAL(18, 4) NOT NULL COMMENT '均价=(最低+最高)/2',
+                    unit VARCHAR(16) NOT NULL DEFAULT '元/吨' COMMENT '单位',
+                    quote_date DATE NOT NULL COMMENT '页面定价日期',
+                    source_url VARCHAR(512) DEFAULT NULL COMMENT '抓取来源 URL',
+                    fetched_at TIMESTAMP NULL DEFAULT NULL COMMENT '最近抓取时间',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+                    UNIQUE KEY uk_slrp_quote_date (quote_date),
+                    INDEX idx_slrp_quote_date (quote_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='SMM 1#铅锭公开页参考价历史';
                 """
             )
             cursor.execute(
