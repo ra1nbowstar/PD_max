@@ -52,6 +52,9 @@ TL比价模块路由
       GET/POST/PUT/DELETE /tl/smelter_calibration_prices — 冶炼厂标定价格历史
       POST /tl/smelter_calibration_prices/batch — 批量新增冶炼厂标定价格
       POST /tl/import_smelter_calibration_excel — Excel 导入冶炼厂标定价格
+      GET /tl/smm_lead_reference_price — 最新 SMM 1#铅锭参考价（默认读库，可 refresh 实时抓取）
+      GET /tl/smm_lead_reference_prices — SMM 1#铅锭参考价历史列表
+      POST /tl/smm_lead_reference_price/sync — 立即抓取并入库
       GET/POST/PUT/DELETE /tl/warehouse_spread_configs — 库房对标差额与毛利配置
       POST /tl/import_warehouse_spread_excel — 导入库房差额与毛利（xlsx，读取全部工作表）
       GET /tl/ai_pricing_analysis — 实时聚合分析（公式：库房定价=对标城市定价+差额；毛利计算版=标定−运费−库房定价）
@@ -118,6 +121,12 @@ from app.services.partner_warehouse_excel import (
     parse_partner_warehouse_rows,
     warehouse_site_fields_from_full_address,
 )
+from app.services.smm_lead_price_service import (
+    get_latest_smm_lead_reference_price,
+    list_smm_lead_reference_prices,
+    sync_smm_lead_reference_price,
+)
+from app.services.smm_lead_scraper import SmmLeadScraperError
 from app.services.tl_service import PurchaseSuggestionLLMError, TLService, get_tl_service
 
 router = APIRouter(prefix="/tl", tags=["TL比价模块"])
@@ -1927,6 +1936,67 @@ async def import_smelter_calibration_excel(
         return await asyncio.to_thread(service.import_smelter_calibration_excel, raw)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/smm_lead_reference_price",
+    summary="最新 SMM 1#铅锭参考价（默认读库）",
+)
+async def smm_lead_reference_price(
+    refresh: bool = Query(
+        False,
+        description="true=立即抓取公开页并入库后返回；false=返回库中最新一条",
+    ),
+):
+    """
+    均价 = (区间最低价 + 区间最高价) / 2。默认定时任务每日入库；无数据或 refresh=true 时现场抓取。
+    """
+    try:
+        if not refresh:
+            latest = await asyncio.to_thread(get_latest_smm_lead_reference_price)
+            if latest is not None:
+                return {"code": 200, "data": latest}
+        return await asyncio.to_thread(sync_smm_lead_reference_price)
+    except SmmLeadScraperError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/smm_lead_reference_prices",
+    summary="SMM 1#铅锭参考价历史列表",
+)
+def smm_lead_reference_prices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    date_from: Optional[str] = Query(None, description="定价日期起 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="定价日期止 YYYY-MM-DD"),
+):
+    try:
+        return list_smm_lead_reference_prices(
+            page=page,
+            page_size=page_size,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/smm_lead_reference_price/sync",
+    summary="立即抓取 SMM 1#铅锭参考价并入库",
+)
+async def smm_lead_reference_price_sync():
+    try:
+        return await asyncio.to_thread(sync_smm_lead_reference_price)
+    except SmmLeadScraperError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

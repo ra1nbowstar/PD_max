@@ -160,6 +160,39 @@ async def on_startup():
             "智能预测模块已关闭（INTELLIGENT_PREDICTION_ENABLED=0），不注册相关路由"
         )
 
+    if app_config.SMM_LEAD_PRICE_SCHEDULE_ENABLED:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        from app.services.smm_lead_price_service import (
+            run_scheduled_smm_lead_sync,
+            startup_smm_lead_sync_if_needed,
+        )
+
+        smm_sched = BackgroundScheduler(timezone="Asia/Shanghai")
+        smm_sched.add_job(
+            func=run_scheduled_smm_lead_sync,
+            trigger=CronTrigger(
+                hour=app_config.SMM_LEAD_PRICE_SCHEDULE_HOUR,
+                minute=app_config.SMM_LEAD_PRICE_SCHEDULE_MINUTE,
+            ),
+            id="smm_lead_reference_price_schedule",
+            replace_existing=True,
+        )
+        smm_sched.start()
+        app.state.smm_lead_scheduler = smm_sched
+        logger.info(
+            "SMM 1#铅锭参考价定时抓取已启用：cron %02d:%02d",
+            app_config.SMM_LEAD_PRICE_SCHEDULE_HOUR,
+            app_config.SMM_LEAD_PRICE_SCHEDULE_MINUTE,
+        )
+        import threading
+
+        threading.Thread(target=startup_smm_lead_sync_if_needed, daemon=True).start()
+    else:
+        app.state.smm_lead_scheduler = None
+        logger.info("SMM 1#铅锭参考价定时抓取已关闭（SMM_LEAD_PRICE_SCHEDULE_ENABLED=0）")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -167,6 +200,9 @@ async def on_shutdown():
         from app.api.v1.routes.ai_detection import shutdown_ai_detection
 
         await shutdown_ai_detection()
+    smm_sched = getattr(app.state, "smm_lead_scheduler", None)
+    if smm_sched is not None:
+        smm_sched.shutdown(wait=False)
     if app_config.INTELLIGENT_PREDICTION_ENABLED:
         sched = getattr(app.state, "ip_prediction_scheduler", None)
         if sched is not None:

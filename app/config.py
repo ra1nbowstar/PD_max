@@ -137,6 +137,17 @@ AI_DETECTION_ENABLED = _env_enabled("AI_DETECTION_ENABLED", default=True)
 # 为 0 时不注册智能预测相关路由、不连 Redis 预热线程、不启动定时预测调度
 INTELLIGENT_PREDICTION_ENABLED = _env_enabled("INTELLIGENT_PREDICTION_ENABLED", default=True)
 
+# SMM 1#铅锭公开页参考价：每日定时抓取入库（默认 10:35 上海时区）
+SMM_LEAD_PRICE_SCHEDULE_ENABLED = _env_enabled("SMM_LEAD_PRICE_SCHEDULE_ENABLED", default=True)
+try:
+    SMM_LEAD_PRICE_SCHEDULE_HOUR = int(os.getenv("SMM_LEAD_PRICE_SCHEDULE_HOUR", "10"))
+except ValueError:
+    SMM_LEAD_PRICE_SCHEDULE_HOUR = 10
+try:
+    SMM_LEAD_PRICE_SCHEDULE_MINUTE = int(os.getenv("SMM_LEAD_PRICE_SCHEDULE_MINUTE", "35"))
+except ValueError:
+    SMM_LEAD_PRICE_SCHEDULE_MINUTE = 35
+
 # 启用「循融宝发货」的冶炼厂在比价/采购建议中货物单价加价（元/吨）；默认 80，可用环境变量覆盖
 try:
     _xrb = (os.getenv("XUNRONGBAO_SHIPPING_PREMIUM_PER_TON", "") or "80").strip() or "80"
