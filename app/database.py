@@ -309,6 +309,38 @@ TABLE_STATEMENTS = [
         UNIQUE KEY uk_inventory_warehouse_category (warehouse_id, category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库库存表（预留）';
     """,
+    # 库房当前库存快照（按日期；页面展示最新一条）
+    """
+    CREATE TABLE IF NOT EXISTS warehouse_inventory_snapshots (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse_id INT NOT NULL COMMENT '库房ID',
+        inventory_ton DECIMAL(14, 4) NOT NULL COMMENT '当前库存(吨)',
+        inventory_date DATE NOT NULL COMMENT '库存日期',
+        source VARCHAR(32) NOT NULL DEFAULT 'import' COMMENT '来源：import/manual',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_wis_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE CASCADE,
+        UNIQUE KEY uk_wis_wh_date (warehouse_id, inventory_date),
+        INDEX idx_wis_wh_date (warehouse_id, inventory_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按日期）';
+    """,
+    # 库房按品种收货价格（回收单价维护）
+    """
+    CREATE TABLE IF NOT EXISTS warehouse_category_receipt_prices (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse_id INT NOT NULL COMMENT '库房ID',
+        category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
+        price_per_ton DECIMAL(14, 4) NOT NULL COMMENT '库房回收单价(元/吨)',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_wcrp_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE CASCADE,
+        UNIQUE KEY uk_wcrp_wh_cat (warehouse_id, category_id),
+        INDEX idx_wcrp_wh (warehouse_id),
+        INDEX idx_wcrp_cat (category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格';
+    """,
     # 冶炼厂需求主表（预留）
     """
     CREATE TABLE IF NOT EXISTS factory_demands (
@@ -1343,6 +1375,55 @@ def create_tables() -> None:
         ensure_pd_vertical_warehouse_ai_snapshots_table()
     except Exception:
         logger.exception("检查/创建 pd_vertical_warehouse_ai_snapshots 表失败")
+    try:
+        ensure_warehouse_inventory_and_receipt_price_tables()
+    except Exception:
+        logger.exception("检查/创建库房库存快照与按品种收货价格表失败")
+
+
+def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
+    """旧库补建：库房库存快照、按品种收货价格表。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS warehouse_inventory_snapshots (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '库房ID',
+                    inventory_ton DECIMAL(14, 4) NOT NULL COMMENT '当前库存(吨)',
+                    inventory_date DATE NOT NULL COMMENT '库存日期',
+                    source VARCHAR(32) NOT NULL DEFAULT 'import' COMMENT '来源：import/manual',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_wis_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    UNIQUE KEY uk_wis_wh_date (warehouse_id, inventory_date),
+                    INDEX idx_wis_wh_date (warehouse_id, inventory_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按日期）';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS warehouse_category_receipt_prices (
+                    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '库房ID',
+                    category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
+                    price_per_ton DECIMAL(14, 4) NOT NULL COMMENT '库房回收单价(元/吨)',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_wcrp_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    UNIQUE KEY uk_wcrp_wh_cat (warehouse_id, category_id),
+                    INDEX idx_wcrp_wh (warehouse_id),
+                    INDEX idx_wcrp_cat (category_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格';
+                """
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def ensure_pd_vertical_warehouse_ai_snapshots_table() -> None:

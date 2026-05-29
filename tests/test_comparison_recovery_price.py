@@ -125,6 +125,51 @@ class ComparisonRecoveryPriceTests(unittest.TestCase):
         self.assertIn("总回收价元每吨", m)
         self.assertIn("总回收价", m)
 
+    def test_gross_margin_fields_with_warehouse_recovery(self) -> None:
+        m = _build_comparison_price_metrics(
+            price=9706.0,
+            source="direct",
+            qrow=self.qrow,
+            merged=self.merged,
+            target_tax=None,
+            t=self.t,
+            fr=100.0,
+            bases=self.bases,
+            sort_basis="base",
+            warehouse_recovery_unit=8000.0,
+        )
+        self.assertEqual(m["总货款"], m["总回收价"])
+        self.assertEqual(m["总运费"], round(100.0 * self.t, 2))
+        self.assertEqual(m["净货款"], round(m["总货款"] - m["总运费"], 2))
+        self.assertEqual(m["回收价"], round(8000.0 * self.t, 2))
+        self.assertEqual(
+            m["毛利"],
+            round(m["总货款"] - m["总运费"] - m["回收价"], 2),
+        )
+        self.assertEqual(m["每吨净值"], round(m["净货款"] / self.t, 2))
+        self.assertEqual(m["每吨毛利"], round(m["毛利"] / self.t, 2))
+        self.assertTrue(m["是否有毛利"])
+        self.assertEqual(m["比价排序值"], m["毛利"])
+
+    def test_no_gross_margin_sorts_by_net_payment(self) -> None:
+        m = _build_comparison_price_metrics(
+            price=9706.0,
+            source="direct",
+            qrow=self.qrow,
+            merged=self.merged,
+            target_tax=None,
+            t=self.t,
+            fr=100.0,
+            bases=self.bases,
+            sort_basis="base",
+            warehouse_recovery_unit=None,
+        )
+        self.assertEqual(m["回收价"], 0.0)
+        self.assertIsNone(m["毛利"])
+        self.assertIsNone(m["每吨毛利"])
+        self.assertFalse(m["是否有毛利"])
+        self.assertEqual(m["比价排序值"], m["净货款"])
+
 
 if __name__ == "__main__":
     unittest.main()

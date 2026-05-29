@@ -956,3 +956,31 @@ class AiPricingSnapshotItemRemarkBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     备注: Optional[str] = None
+
+
+class WarehouseInventoryCreate(BaseModel):
+    """手工录入/覆盖库房某日库存"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    库房id: int = Field(..., ge=1)
+    当前库存: float = Field(..., description="库存吨数")
+    库存日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
+
+
+class WarehouseReceiptPriceCreate(BaseModel):
+    """新增/覆盖库房按品种收货价格"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    库房id: int = Field(..., ge=1)
+    品类id: int = Field(..., ge=1, description="dict_categories.category_id")
+    价格: float = Field(..., description="库房回收单价，元/吨")
+
+
+class WarehouseReceiptPriceUpdate(BaseModel):
+    """修改库房按品种收货价格"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    价格: float = Field(..., description="库房回收单价，元/吨")

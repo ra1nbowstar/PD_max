@@ -109,6 +109,9 @@ from app.models.tl import (
     SmelterCalibrationPriceUpdate,
     WarehouseSpreadConfigCreate,
     WarehouseSpreadConfigUpdate,
+    WarehouseInventoryCreate,
+    WarehouseReceiptPriceCreate,
+    WarehouseReceiptPriceUpdate,
 )
 from app.services.partner_warehouse_excel import (
     PartnerWarehouseExcelError,
@@ -2132,6 +2135,205 @@ async def import_warehouse_spread_excel(
             service.import_warehouse_spread_excel,
             raw,
             overwrite=overwrite,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/warehouse_inventories", summary="库房当前库存列表（每库房最新一条）")
+def warehouse_inventories(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    keyword: Optional[str] = Query(None, description="库房名称模糊"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_warehouse_inventories(
+            page=page, page_size=page_size, keyword=keyword
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/warehouse_inventories", summary="手工录入/覆盖库房某日库存")
+def warehouse_inventories_create(
+    body: WarehouseInventoryCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_warehouse_inventory(
+            warehouse_id=body.库房id,
+            inventory_ton=body.当前库存,
+            inventory_date=body.库存日期,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/download_warehouse_inventory_template_excel",
+    summary="下载库房库存导入模板（xlsx）",
+)
+def download_warehouse_inventory_template_excel(
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        data = service.download_warehouse_inventory_template_excel()
+        fn = "库房库存导入模板.xlsx"
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}",
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import_warehouse_inventory_excel", summary="Excel 导入库房当前库存")
+async def import_warehouse_inventory_excel(
+    file: UploadFile = File(..., description="xlsx；表头须含库房名称、当前库存，可选库存日期"),
+    overwrite: bool = Form(True, description="同库房同日期是否覆盖"),
+    service: TLService = Depends(get_tl_service),
+):
+    fn = (file.filename or "").lower()
+    if not fn.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 或 .xlsm 文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    try:
+        return await asyncio.to_thread(
+            service.import_warehouse_inventory_excel, raw, overwrite=overwrite
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/warehouse_receipt_prices", summary="库房按品种收货价格列表")
+def warehouse_receipt_prices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    warehouse_id: Optional[int] = Query(None, ge=1),
+    category_id: Optional[int] = Query(None, ge=1),
+    keyword: Optional[str] = Query(None, description="库房名/品种名模糊"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_warehouse_receipt_prices(
+            page=page,
+            page_size=page_size,
+            warehouse_id=warehouse_id,
+            category_id=category_id,
+            keyword=keyword,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/warehouse_receipt_prices", summary="新增/覆盖库房按品种收货价格")
+def warehouse_receipt_prices_create(
+    body: WarehouseReceiptPriceCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_warehouse_receipt_price(
+            warehouse_id=body.库房id,
+            category_id=body.品类id,
+            price_per_ton=body.价格,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put(
+    "/warehouse_receipt_prices/{price_id}",
+    summary="修改库房按品种收货价格",
+)
+def warehouse_receipt_prices_update(
+    price_id: int,
+    body: WarehouseReceiptPriceUpdate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.update_warehouse_receipt_price(
+            price_id, price_per_ton=body.价格
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/warehouse_receipt_prices/{price_id}",
+    summary="删除库房按品种收货价格",
+)
+def warehouse_receipt_prices_delete(
+    price_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_receipt_price(price_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/download_warehouse_receipt_prices_template_excel",
+    summary="下载库房收货价格导入模板（xlsx）",
+)
+def download_warehouse_receipt_prices_template_excel(
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        data = service.download_warehouse_receipt_prices_template_excel()
+        fn = "库房收货价格导入模板.xlsx"
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}",
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/import_warehouse_receipt_prices_excel",
+    summary="Excel 导入库房按品种收货价格",
+)
+async def import_warehouse_receipt_prices_excel(
+    file: UploadFile = File(
+        ..., description="xlsx；表头须含库房名称、回收品种、价格"
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    fn = (file.filename or "").lower()
+    if not fn.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 或 .xlsm 文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    try:
+        return await asyncio.to_thread(
+            service.import_warehouse_receipt_prices_excel, raw
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

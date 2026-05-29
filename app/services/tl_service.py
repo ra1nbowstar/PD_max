@@ -42,6 +42,14 @@ from app.services.smelter_calibration_excel import (
     SmelterCalibrationExcelError,
     parse_smelter_calibration_workbook,
 )
+from app.services.warehouse_inventory_excel import (
+    WarehouseInventoryExcelError,
+    parse_warehouse_inventory_workbook,
+)
+from app.services.warehouse_receipt_price_excel import (
+    WarehouseReceiptPriceExcelError,
+    parse_warehouse_receipt_price_workbook,
+)
 from app.services.warehouse_spread_excel import (
     SpreadImportRow,
     WarehouseSpreadExcelError,
@@ -138,6 +146,7 @@ def _build_comparison_price_metrics(
     fr: float,
     bases: List[str],
     sort_basis: str,
+    warehouse_recovery_unit: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     由 resolve 得到的报价与运费、吨数生成比价行中的价/税/利润字段块
@@ -148,6 +157,9 @@ def _build_comparison_price_metrics(
     ``总回收价 = 最优价各口径利润[sort_basis] + 总运费``（有报价时）。
     ``总价``/``报价金额`` 仍按 price_type 折合不含税 p_net，语义不变；sort_basis=base 且
     p_net 亦为基准时二者可能数值相等，但展示口径不同。
+
+    新增业务字段：总货款、净货款、每吨净值、回收价、毛利、每吨毛利、比价排序值。
+    有维护库房回收单价时按毛利比价，否则按净货款比价。
     """
     if price is not None and target_tax and target_tax in merged:
         p_net = round(net_from_inclusive(float(price), merged[target_tax]), 2)
@@ -198,6 +210,31 @@ def _build_comparison_price_metrics(
             round(recovery_unit * t, 2) if recovery_unit is not None else None
         )
 
+    total_payment = recovery_total
+    net_payment: Optional[float] = (
+        round(total_payment - freight_cost_total, 2)
+        if total_payment is not None
+        else round(-freight_cost_total, 2)
+    )
+    has_gross_margin = warehouse_recovery_unit is not None
+    recovery_amount = (
+        round(float(warehouse_recovery_unit) * t, 2)
+        if has_gross_margin
+        else 0.0
+    )
+    gross_margin: Optional[float] = None
+    gross_margin_per_ton: Optional[float] = None
+    if has_gross_margin:
+        if total_payment is not None:
+            gross_margin = round(total_payment - freight_cost_total - recovery_amount, 2)
+        else:
+            gross_margin = round(-freight_cost_total - recovery_amount, 2)
+        gross_margin_per_ton = (
+            round(gross_margin / t, 2) if t > 0 else None
+        )
+    net_per_ton = round(net_payment / t, 2) if t > 0 else None
+    sort_value = gross_margin if has_gross_margin else net_payment
+
     return {
         "单价": p_net if source != "unavailable" else None,
         "总价": quote_amount,
@@ -216,6 +253,14 @@ def _build_comparison_price_metrics(
         "总回收价元每吨": recovery_unit,
         "总回收价": recovery_total,
         "最优价各口径利润": optimal_profits,
+        "总货款": total_payment,
+        "净货款": net_payment,
+        "每吨净值": net_per_ton,
+        "回收价": recovery_amount,
+        "毛利": gross_margin,
+        "每吨毛利": gross_margin_per_ton,
+        "是否有毛利": has_gross_margin,
+        "比价排序值": sort_value,
     }
 
 
@@ -649,7 +694,9 @@ class TLService:
             "危废经营许可数量": item.get("hazardousWasteLicenseQty"),
             "月均收货": item.get("monthlyAvgReceiptTon"),
             "当前库存": item.get("currentInventoryTon"),
+            "库存日期": item.get("inventoryDate"),
             "收货价格": item.get("receiptPricePerTon"),
+            "收货价格按品种": item.get("receiptPricesByCategory") or [],
             "运费": item.get("freightAmount"),
             "仓库类型id": wt_id,
             "类型": tname,
@@ -721,6 +768,76 @@ class TLService:
             logger.warning(f"批量加载库房到冶炼厂运费失败: {e}")
         return out
 
+    def _enrich_warehouse_rows_inventory_and_prices(
+        self, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """为库房列表补充最新库存日期与按品种收货价格。"""
+        if not rows:
+            return rows
+        wh_ids = list(
+            dict.fromkeys(int(r["仓库id"]) for r in rows if r.get("仓库id") is not None)
+        )
+        if not wh_ids:
+            return rows
+        inv_date_by_wh: Dict[int, date] = {}
+        prices_by_wh: Dict[int, List[Dict[str, Any]]] = {wid: [] for wid in wh_ids}
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(wh_ids))
+                    cur.execute(
+                        f"""
+                        SELECT wis.warehouse_id, wis.inventory_date
+                        FROM warehouse_inventory_snapshots wis
+                        INNER JOIN (
+                            SELECT warehouse_id, MAX(inventory_date) AS max_date
+                            FROM warehouse_inventory_snapshots
+                            WHERE warehouse_id IN ({ph})
+                            GROUP BY warehouse_id
+                        ) latest ON wis.warehouse_id = latest.warehouse_id
+                            AND wis.inventory_date = latest.max_date
+                        WHERE wis.warehouse_id IN ({ph})
+                        """,
+                        tuple(wh_ids) + tuple(wh_ids),
+                    )
+                    for wh_id, inv_date in cur.fetchall():
+                        inv_date_by_wh[int(wh_id)] = inv_date
+
+                    cur.execute(
+                        f"""
+                        SELECT wcrp.warehouse_id, wcrp.category_id, wcrp.price_per_ton,
+                            COALESCE(
+                                MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
+                                MAX(dc.name)
+                            ) AS cat_name
+                        FROM warehouse_category_receipt_prices wcrp
+                        JOIN dict_categories dc ON dc.category_id = wcrp.category_id
+                            AND dc.is_active = 1
+                        WHERE wcrp.warehouse_id IN ({ph})
+                        GROUP BY wcrp.warehouse_id, wcrp.category_id, wcrp.price_per_ton
+                        ORDER BY wcrp.warehouse_id, wcrp.category_id
+                        """,
+                        tuple(wh_ids),
+                    )
+                    for wh_id, cat_id, price, cat_name in cur.fetchall():
+                        prices_by_wh[int(wh_id)].append(
+                            {
+                                "品类id": int(cat_id),
+                                "品类名": str(cat_name or ""),
+                                "价格": float(price),
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"加载库房库存日期/收货价格失败: {e}")
+            return rows
+
+        for rec in rows:
+            wid = int(rec["仓库id"])
+            inv_d = inv_date_by_wh.get(wid)
+            rec["库存日期"] = inv_d.isoformat() if inv_d else None
+            rec["收货价格按品种"] = prices_by_wh.get(wid, [])
+        return rows
+
     def _enrich_warehouse_rows_with_freight(
         self, rows: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -775,7 +892,9 @@ class TLService:
                     row["库房类型颜色配置"] = t_cc
                     row["颜色配置"] = t_cc
                     out_rows.append(row)
-                out_rows = self._enrich_warehouse_rows_with_freight(out_rows)
+                out_rows = self._enrich_warehouse_rows_with_freight(
+                    self._enrich_warehouse_rows_inventory_and_prices(out_rows)
+                )
                 return {
                     "list": out_rows,
                     "total": int(payload.get("total") or 0),
@@ -843,7 +962,9 @@ class TLService:
                         rec["仓库颜色配置"] = wh_cc
                         rec["颜色配置"] = type_cc
                         out.append(rec)
-                    return self._enrich_warehouse_rows_with_freight(out)
+                    return self._enrich_warehouse_rows_with_freight(
+                        self._enrich_warehouse_rows_inventory_and_prices(out)
+                    )
         except Exception as e:
             logger.error(f"获取仓库列表失败: {e}")
             raise
@@ -2330,7 +2451,11 @@ class TLService:
         若传入 ``tons_by_category``，则每个品类使用对应 t；否则所有品类共用 ``tons``。
         **利润** = 总价 − 运费（与 **报价金额 − 总运费** 一致）。
         明细中同时保留 **`报价`/`报价金额`/`总运费`** 与上述 **`单价`/`总价`/`运费单价`/`运费`** 便于新旧前端兼容。
-        前端最终比价、明细排序与 **`冶炼厂利润排行`** 均以该 **`利润`**（及所选最优价口径）为准。
+        **总货款** = 冶炼厂回收单价（最优价排序口径）× 吨数，与 **总回收价** 同值；
+        **净货款** = 总货款 − 总运费；**回收价** = 库房回收单价 × 吨数（未维护为 0）；
+        **毛利** = 总货款 − 总运费 − 回收价（仅维护库房回收单价时返回）；
+        **每吨净值** = 净货款 ÷ 吨数；**每吨毛利** = 毛利 ÷ 吨数。
+        明细排序与 **冶炼厂利润排行** 按 **比价排序值**：有毛利时按毛利，否则按净货款。
         **最优价各口径利润**=该口径下元/吨单价×t−总运费（与主利润同一套总运费）。
         同时按表中已有列统一反推 `基准价`（不含税）、`含1%税价`、`含3%税价`（与 OCR 按税点入库、再换算一致）；
         `利润_基准`=基准价×t−总运费，`利润_含3%`=含3%税价×t−总运费。
@@ -2487,6 +2612,15 @@ class TLService:
                                 float(fa_v) if fa_v is not None else None
                             ),
                         }
+                    cur.execute(
+                        f"SELECT warehouse_id, category_id, price_per_ton "
+                        f"FROM warehouse_category_receipt_prices "
+                        f"WHERE warehouse_id IN ({wh_ph})",
+                        tuple(warehouse_ids),
+                    )
+                    wh_receipt_unit_map: Dict[Tuple[int, int], float] = {}
+                    for wh_id, cat_id, unit_price in cur.fetchall():
+                        wh_receipt_unit_map[(int(wh_id), int(cat_id))] = float(unit_price)
                     cur.execute(
                         f"SELECT id, name FROM dict_factories WHERE id IN ({sm_ph})",
                         tuple(smelter_ids),
@@ -2720,6 +2854,14 @@ class TLService:
                 "总回收价元每吨",
                 "总回收价",
                 "最优价各口径利润",
+                "总货款",
+                "净货款",
+                "每吨净值",
+                "回收价",
+                "毛利",
+                "每吨毛利",
+                "是否有毛利",
+                "比价排序值",
             )
 
             def _xrb_branch_snapshot(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -2742,6 +2884,7 @@ class TLService:
                     fr = float(freight) if freight is not None else 0.0
                     merged = merge_factory_rates(tax_rate_map.get(fid, {}))
                     xrb_on = fid in xrb_fids
+                    wh_recovery_unit = wh_receipt_unit_map.get((int(wid), int(cid)))
 
                     price_exc, source_exc, qrow_exc = resolve_price(
                         fid, cid, raw_price_map
@@ -2760,6 +2903,7 @@ class TLService:
                             fr,
                             bases,
                             sort_basis,
+                            warehouse_recovery_unit=wh_recovery_unit,
                         )
                         metrics_inc = _build_comparison_price_metrics(
                             price_inc,
@@ -2771,6 +2915,7 @@ class TLService:
                             fr,
                             bases,
                             sort_basis,
+                            warehouse_recovery_unit=wh_recovery_unit,
                         )
                         top = metrics_inc
                     else:
@@ -2784,6 +2929,7 @@ class TLService:
                             fr,
                             bases,
                             sort_basis,
+                            warehouse_recovery_unit=wh_recovery_unit,
                         )
                         metrics_exc = metrics_inc
                         top = metrics_inc
@@ -2827,14 +2973,14 @@ class TLService:
 
             result.sort(
                 key=lambda r: (
-                    r["最优价各口径利润"][sort_basis]
-                    if r["最优价各口径利润"].get(sort_basis) is not None
+                    r["比价排序值"]
+                    if r.get("比价排序值") is not None
                     else float("-inf")
                 ),
                 reverse=True,
             )
 
-            # 按冶炼厂汇总；排行按「最优价排序口径」对应利润合计从高到低
+            # 按冶炼厂汇总；排行按各行比价排序值合计从高到低
             agg: Dict[int, Dict[str, Any]] = {}
             for row in result:
                 sfid = int(row["冶炼厂id"])
@@ -2846,6 +2992,9 @@ class TLService:
                         "利润_含3%合计": 0.0,
                         "利润_基准合计": 0.0,
                         "最优价口径合计": {b: 0.0 for b in bases},
+                        "净货款合计": 0.0,
+                        "毛利合计": 0.0,
+                        "比价排序合计": 0.0,
                     }
                 agg[sfid]["利润"] += float(row["利润"])
                 if row["利润_含3%"] is not None:
@@ -2857,6 +3006,13 @@ class TLService:
                     pv = op.get(b)
                     if pv is not None:
                         agg[sfid]["最优价口径合计"][b] += float(pv)
+                if row.get("净货款") is not None:
+                    agg[sfid]["净货款合计"] += float(row["净货款"])
+                if row.get("毛利") is not None:
+                    agg[sfid]["毛利合计"] += float(row["毛利"])
+                sv = row.get("比价排序值")
+                if sv is not None:
+                    agg[sfid]["比价排序合计"] += float(sv)
 
             ranking = sorted(
                 (
@@ -2868,10 +3024,13 @@ class TLService:
                         "最优价口径合计": {
                             b: round(v["最优价口径合计"][b], 2) for b in bases
                         },
+                        "净货款合计": round(v["净货款合计"], 2),
+                        "毛利合计": round(v["毛利合计"], 2),
+                        "比价排序合计": round(v["比价排序合计"], 2),
                     }
                     for v in agg.values()
                 ),
-                key=lambda x: x["最优价口径合计"][sort_basis],
+                key=lambda x: x["比价排序合计"],
                 reverse=True,
             )
             return {
@@ -7828,6 +7987,545 @@ class TLService:
                 if cur.rowcount == 0:
                     raise ValueError("明细不存在")
         return {"code": 200, "msg": "已删除明细"}
+
+    # ==================== 库房库存快照 ====================
+
+    def _sync_warehouse_current_inventory_from_snapshot(
+        self, cur, warehouse_id: int
+    ) -> None:
+        cur.execute(
+            """
+            SELECT inventory_ton FROM warehouse_inventory_snapshots
+            WHERE warehouse_id = %s
+            ORDER BY inventory_date DESC, id DESC
+            LIMIT 1
+            """,
+            (int(warehouse_id),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return
+        cur.execute(
+            "UPDATE dict_warehouses SET current_inventory_ton = %s WHERE id = %s",
+            (row[0], int(warehouse_id)),
+        )
+
+    def list_warehouse_inventories(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        keyword: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * page_size
+        conditions = ["1=1"]
+        params: List[Any] = []
+        kw = (keyword or "").strip()
+        if kw:
+            conditions.append("dw.name LIKE %s")
+            params.append(f"%{kw}%")
+        where_sql = " AND ".join(conditions)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) FROM (
+                        SELECT wis.warehouse_id
+                        FROM warehouse_inventory_snapshots wis
+                        JOIN dict_warehouses dw ON dw.id = wis.warehouse_id
+                        INNER JOIN (
+                            SELECT warehouse_id, MAX(inventory_date) AS max_date
+                            FROM warehouse_inventory_snapshots
+                            GROUP BY warehouse_id
+                        ) latest ON wis.warehouse_id = latest.warehouse_id
+                            AND wis.inventory_date = latest.max_date
+                        WHERE {where_sql}
+                        GROUP BY wis.warehouse_id
+                    ) t
+                    """,
+                    tuple(params),
+                )
+                total = int(cur.fetchone()[0])
+                cur.execute(
+                    f"""
+                    SELECT wis.id, wis.warehouse_id, dw.name, wis.inventory_ton,
+                           wis.inventory_date, wis.source, wis.updated_at
+                    FROM warehouse_inventory_snapshots wis
+                    JOIN dict_warehouses dw ON dw.id = wis.warehouse_id
+                    INNER JOIN (
+                        SELECT warehouse_id, MAX(inventory_date) AS max_date
+                        FROM warehouse_inventory_snapshots
+                        GROUP BY warehouse_id
+                    ) latest ON wis.warehouse_id = latest.warehouse_id
+                        AND wis.inventory_date = latest.max_date
+                    WHERE {where_sql}
+                    ORDER BY wis.inventory_date DESC, wis.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params) + (page_size, offset),
+                )
+                items = []
+                for r in cur.fetchall():
+                    items.append(
+                        {
+                            "id": int(r[0]),
+                            "库房id": int(r[1]),
+                            "库房名称": r[2],
+                            "当前库存": float(r[3]),
+                            "库存日期": r[4].isoformat() if r[4] else None,
+                            "来源": r[5],
+                            "更新时间": r[6].isoformat() if r[6] else None,
+                        }
+                    )
+        return {
+            "code": 200,
+            "data": {"total": total, "list": items, "page": page, "page_size": page_size},
+        }
+
+    def create_warehouse_inventory(
+        self,
+        *,
+        warehouse_id: int,
+        inventory_ton: float,
+        inventory_date: Optional[str] = None,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        if warehouse_id < 1:
+            raise ValueError("库房 id 无效")
+        inv_day = (
+            date.fromisoformat(str(inventory_date).strip())
+            if inventory_date and str(inventory_date).strip()
+            else self._pricing_calendar_date()
+        )
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+                        (int(warehouse_id),),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError("库房不存在或已停用")
+                    cur.execute(
+                        """
+                        INSERT INTO warehouse_inventory_snapshots
+                        (warehouse_id, inventory_ton, inventory_date, source)
+                        VALUES (%s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            inventory_ton = VALUES(inventory_ton),
+                            source = VALUES(source),
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (int(warehouse_id), inventory_ton, inv_day, source),
+                    )
+                    snap_id = int(cur.lastrowid)
+                    if snap_id == 0:
+                        cur.execute(
+                            """
+                            SELECT id FROM warehouse_inventory_snapshots
+                            WHERE warehouse_id = %s AND inventory_date = %s
+                            """,
+                            (int(warehouse_id), inv_day),
+                        )
+                        row = cur.fetchone()
+                        snap_id = int(row[0]) if row else 0
+                    self._sync_warehouse_current_inventory_from_snapshot(
+                        cur, int(warehouse_id)
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {
+            "code": 200,
+            "msg": "库存已保存",
+            "data": {
+                "id": snap_id,
+                "库房id": int(warehouse_id),
+                "当前库存": float(inventory_ton),
+                "库存日期": inv_day.isoformat(),
+            },
+        }
+
+    def import_warehouse_inventory_excel(
+        self, content: bytes, *, overwrite: bool = True
+    ) -> Dict[str, Any]:
+        try:
+            parsed_rows, meta = parse_warehouse_inventory_workbook(content)
+        except WarehouseInventoryExcelError as e:
+            raise ValueError(str(e)) from e
+
+        default_day = self._pricing_calendar_date()
+        stats = {
+            "success": 0,
+            "skipped_errors": 0,
+            "skipped_no_overwrite": 0,
+        }
+        errors: List[str] = []
+        samples: List[Dict[str, Any]] = []
+
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    for row in parsed_rows:
+                        try:
+                            wh_id, match_kind = self._match_warehouse_id(
+                                row.warehouse_name, exact, canon
+                            )
+                            if wh_id is None:
+                                if match_kind == "ambiguous":
+                                    raise ValueError(
+                                        f"库房名称「{row.warehouse_name}」匹配到多个库房"
+                                    )
+                                raise ValueError(
+                                    f"库房名称「{row.warehouse_name}」不存在"
+                                )
+                            inv_day = row.inventory_date or default_day
+                            if not overwrite:
+                                cur.execute(
+                                    """
+                                    SELECT id FROM warehouse_inventory_snapshots
+                                    WHERE warehouse_id = %s AND inventory_date = %s
+                                    """,
+                                    (wh_id, inv_day),
+                                )
+                                if cur.fetchone():
+                                    stats["skipped_no_overwrite"] += 1
+                                    continue
+                            cur.execute(
+                                """
+                                INSERT INTO warehouse_inventory_snapshots
+                                (warehouse_id, inventory_ton, inventory_date, source)
+                                VALUES (%s, %s, %s, 'import')
+                                ON DUPLICATE KEY UPDATE
+                                    inventory_ton = VALUES(inventory_ton),
+                                    source = 'import',
+                                    updated_at = CURRENT_TIMESTAMP
+                                """,
+                                (wh_id, row.inventory_ton, inv_day),
+                            )
+                            self._sync_warehouse_current_inventory_from_snapshot(
+                                cur, wh_id
+                            )
+                            stats["success"] += 1
+                            if len(samples) < 20:
+                                samples.append(
+                                    {
+                                        "Excel行": row.excel_row,
+                                        "库房id": wh_id,
+                                        "库房名称": row.warehouse_name,
+                                        "当前库存": _cell_json(row.inventory_ton),
+                                        "库存日期": inv_day.isoformat(),
+                                        "匹配": match_kind,
+                                    }
+                                )
+                        except ValueError as e:
+                            stats["skipped_errors"] += 1
+                            errors.append(f"第 {row.excel_row} 行：{e}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        msg = f"已导入 {stats['success']} 条库存记录"
+        if stats["skipped_errors"]:
+            msg += f"，{stats['skipped_errors']} 行跳过"
+        return {
+            "code": 200,
+            "msg": msg,
+            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+        }
+
+    def download_warehouse_inventory_template_excel(self) -> bytes:
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "导入数据"
+        ws.append(["库房名称", "当前库存", "库存日期"])
+        ws.append(["示例库房A", 120.5, "2026-05-29"])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    # ==================== 库房按品种收货价格 ====================
+
+    def _resolve_category_id_by_name(self, cur, category_name: str) -> int:
+        name = str(category_name).strip()
+        if not name:
+            raise ValueError("回收品种不能为空")
+        cur.execute(
+            "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1",
+            (name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"回收品种「{name}」不存在")
+        return int(row[0])
+
+    def list_warehouse_receipt_prices(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        warehouse_id: Optional[int] = None,
+        category_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * page_size
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if warehouse_id is not None:
+            conditions.append("wcrp.warehouse_id = %s")
+            params.append(int(warehouse_id))
+        if category_id is not None:
+            conditions.append("wcrp.category_id = %s")
+            params.append(int(category_id))
+        kw = (keyword or "").strip()
+        if kw:
+            conditions.append("(dw.name LIKE %s OR dc.name LIKE %s)")
+            params.extend([f"%{kw}%", f"%{kw}%"])
+        where_sql = " AND ".join(conditions)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM warehouse_category_receipt_prices wcrp
+                    JOIN dict_warehouses dw ON dw.id = wcrp.warehouse_id
+                    JOIN dict_categories dc ON dc.category_id = wcrp.category_id
+                        AND dc.is_active = 1
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                total = int(cur.fetchone()[0])
+                cur.execute(
+                    f"""
+                    SELECT wcrp.id, wcrp.warehouse_id, dw.name, wcrp.category_id,
+                           COALESCE(
+                               MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
+                               MAX(dc.name)
+                           ) AS cat_name,
+                           wcrp.price_per_ton, wcrp.updated_at
+                    FROM warehouse_category_receipt_prices wcrp
+                    JOIN dict_warehouses dw ON dw.id = wcrp.warehouse_id
+                    JOIN dict_categories dc ON dc.category_id = wcrp.category_id
+                        AND dc.is_active = 1
+                    WHERE {where_sql}
+                    GROUP BY wcrp.id, wcrp.warehouse_id, dw.name, wcrp.category_id,
+                             wcrp.price_per_ton, wcrp.updated_at
+                    ORDER BY wcrp.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params) + (page_size, offset),
+                )
+                items = []
+                for r in cur.fetchall():
+                    items.append(
+                        {
+                            "id": int(r[0]),
+                            "库房id": int(r[1]),
+                            "库房名称": r[2],
+                            "品类id": int(r[3]),
+                            "品类名": r[4],
+                            "价格": float(r[5]),
+                            "更新时间": r[6].isoformat() if r[6] else None,
+                        }
+                    )
+        return {
+            "code": 200,
+            "data": {"total": total, "list": items, "page": page, "page_size": page_size},
+        }
+
+    def create_warehouse_receipt_price(
+        self, *, warehouse_id: int, category_id: int, price_per_ton: float
+    ) -> Dict[str, Any]:
+        if warehouse_id < 1 or category_id < 1:
+            raise ValueError("库房或品类 id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+                    (int(warehouse_id),),
+                )
+                if not cur.fetchone():
+                    raise ValueError("库房不存在或已停用")
+                cur.execute(
+                    "SELECT category_id FROM dict_categories WHERE category_id = %s AND is_active = 1 LIMIT 1",
+                    (int(category_id),),
+                )
+                if not cur.fetchone():
+                    raise ValueError("品类不存在或已停用")
+                cur.execute(
+                    """
+                    INSERT INTO warehouse_category_receipt_prices
+                    (warehouse_id, category_id, price_per_ton)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        price_per_ton = VALUES(price_per_ton),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(warehouse_id), int(category_id), price_per_ton),
+                )
+                rec_id = int(cur.lastrowid)
+                if rec_id == 0:
+                    cur.execute(
+                        """
+                        SELECT id FROM warehouse_category_receipt_prices
+                        WHERE warehouse_id = %s AND category_id = %s
+                        """,
+                        (int(warehouse_id), int(category_id)),
+                    )
+                    row = cur.fetchone()
+                    rec_id = int(row[0]) if row else 0
+        return {
+            "code": 200,
+            "msg": "收货价格已保存",
+            "data": {
+                "id": rec_id,
+                "库房id": int(warehouse_id),
+                "品类id": int(category_id),
+                "价格": float(price_per_ton),
+            },
+        }
+
+    def update_warehouse_receipt_price(
+        self, price_id: int, *, price_per_ton: float
+    ) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE warehouse_category_receipt_prices
+                    SET price_per_ton = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                    """,
+                    (price_per_ton, int(price_id)),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已更新收货价格"}
+
+    def delete_warehouse_receipt_price(self, price_id: int) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM warehouse_category_receipt_prices WHERE id = %s",
+                    (int(price_id),),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已删除收货价格"}
+
+    def import_warehouse_receipt_prices_excel(self, content: bytes) -> Dict[str, Any]:
+        try:
+            parsed_rows, meta = parse_warehouse_receipt_price_workbook(content)
+        except WarehouseReceiptPriceExcelError as e:
+            raise ValueError(str(e)) from e
+
+        stats = {"success": 0, "skipped_errors": 0}
+        errors: List[str] = []
+        samples: List[Dict[str, Any]] = []
+
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    for row in parsed_rows:
+                        try:
+                            wh_id, match_kind = self._match_warehouse_id(
+                                row.warehouse_name, exact, canon
+                            )
+                            if wh_id is None:
+                                if match_kind == "ambiguous":
+                                    raise ValueError(
+                                        f"库房名称「{row.warehouse_name}」匹配到多个库房"
+                                    )
+                                raise ValueError(
+                                    f"库房名称「{row.warehouse_name}」不存在"
+                                )
+                            cat_id = self._resolve_category_id_by_name(
+                                cur, row.category_name
+                            )
+                            cur.execute(
+                                """
+                                INSERT INTO warehouse_category_receipt_prices
+                                (warehouse_id, category_id, price_per_ton)
+                                VALUES (%s, %s, %s)
+                                ON DUPLICATE KEY UPDATE
+                                    price_per_ton = VALUES(price_per_ton),
+                                    updated_at = CURRENT_TIMESTAMP
+                                """,
+                                (wh_id, cat_id, row.price_per_ton),
+                            )
+                            rec_id = int(cur.lastrowid)
+                            if rec_id == 0:
+                                cur.execute(
+                                    """
+                                    SELECT id FROM warehouse_category_receipt_prices
+                                    WHERE warehouse_id = %s AND category_id = %s
+                                    """,
+                                    (wh_id, cat_id),
+                                )
+                                found = cur.fetchone()
+                                rec_id = int(found[0]) if found else 0
+                            stats["success"] += 1
+                            if len(samples) < 20:
+                                samples.append(
+                                    {
+                                        "Excel行": row.excel_row,
+                                        "id": rec_id,
+                                        "库房id": wh_id,
+                                        "库房名称": row.warehouse_name,
+                                        "品类id": cat_id,
+                                        "品类名": row.category_name,
+                                        "价格": _cell_json(row.price_per_ton),
+                                        "匹配": match_kind,
+                                    }
+                                )
+                        except ValueError as e:
+                            stats["skipped_errors"] += 1
+                            errors.append(f"第 {row.excel_row} 行：{e}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        msg = f"已导入 {stats['success']} 条收货价格"
+        if stats["skipped_errors"]:
+            msg += f"，{stats['skipped_errors']} 行跳过"
+        return {
+            "code": 200,
+            "msg": msg,
+            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+        }
+
+    def download_warehouse_receipt_prices_template_excel(self) -> bytes:
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "导入数据"
+        ws.append(["库房名称", "回收品种", "价格"])
+        ws.append(["示例库房A", "电动电瓶", 15200])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
 
 
 # ==================== 单例工厂 ====================
