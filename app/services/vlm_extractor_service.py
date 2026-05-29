@@ -49,6 +49,7 @@ try:
 except ImportError:
     pass
 
+from app.config import resolve_bailian_base_url
 from app.price_tax_utils import derive_vat_prices_from_stated_price, parse_price_basis_from_remark
 
 try:
@@ -169,7 +170,10 @@ class VLMConfig(BaseModel):
     def model_post_init(self, __context) -> None:
         if not self.api_key:
             self.api_key = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
-        
+
+        env_base = (os.getenv("VLM_BASE_URL") or self.base_url or "").strip()
+        self.base_url = resolve_bailian_base_url(self.api_key or "", env_base)
+
         if not self.api_key:
             raise ValueError(
                 f"未设置API Key。请通过以下方式之一提供：\n"

@@ -41,6 +41,41 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change_this_to_a_strong_random_sec
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 默认 24 小时
 
+# 百炼 OpenAI 兼容端点（地域：中国内地）
+DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# Token Plan 团队版专属（sk-sp- key，与 Coding Plan / 通用 key 不互通）
+TOKEN_PLAN_COMPATIBLE_BASE_URL = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+# Coding Plan 专属（sk-sp- key，须与 Token Plan 区分，见 BAILIAN_PLAN_TYPE）
+DASHSCOPE_CODING_PLAN_BASE_URL = "https://coding.dashscope.aliyuncs.com/v1"
+
+
+def resolve_bailian_base_url(api_key: str, explicit_base_url: str = "") -> str:
+    """按 API Key 与套餐类型选择百炼兼容端点。
+
+    sk-sp- 前缀可能属于 Token Plan 或 Coding Plan，二者 Base URL 不同；
+    可通过 BAILIAN_PLAN_TYPE=token_plan|coding_plan 指定，未配置时默认 token_plan。
+    若已显式设置 LLM_BASE_URL / VLM_BASE_URL，优先使用显式值。
+    """
+    explicit = (explicit_base_url or "").strip()
+    if explicit:
+        return explicit
+    key = (api_key or "").strip()
+    if not key.startswith("sk-sp-"):
+        return DASHSCOPE_COMPATIBLE_BASE_URL
+    plan = (
+        os.getenv("BAILIAN_PLAN_TYPE", "").strip()
+        or os.getenv("DASHSCOPE_PLAN_TYPE", "").strip()
+        or "token_plan"
+    ).lower()
+    if plan in ("coding_plan", "coding"):
+        return DASHSCOPE_CODING_PLAN_BASE_URL
+    return TOKEN_PLAN_COMPATIBLE_BASE_URL
+
+
+# 向后兼容旧函数名
+resolve_dashscope_base_url = resolve_bailian_base_url
+
+
 # LLM API 配置（采购建议等文本接口，OpenAI 兼容协议）
 # 未单独配置 LLM_API_KEY 时，按顺序复用 DASHSCOPE_API_KEY / QWEN_API_KEY / VLM_API_KEY（与报价图识别同源 key 时可少配一项）
 _explicit_llm_key = os.getenv("LLM_API_KEY", "").strip()
@@ -53,11 +88,12 @@ LLM_API_KEY = (
 _llm_base_env = os.getenv("LLM_BASE_URL", "").strip()
 if _llm_base_env:
     LLM_BASE_URL = _llm_base_env
+elif (LLM_API_KEY or "").strip().startswith("sk-sp-"):
+    LLM_BASE_URL = resolve_bailian_base_url(LLM_API_KEY, "")
 elif _explicit_llm_key:
     LLM_BASE_URL = "https://api.anthropic.com"
 else:
-    # 使用兜底 key 时默认走阿里云百炼兼容端点（与 VLM 默认一致）
-    LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    LLM_BASE_URL = DASHSCOPE_COMPATIBLE_BASE_URL
 _llm_model_env = os.getenv("LLM_MODEL", "").strip()
 if _llm_model_env:
     LLM_MODEL = _llm_model_env
@@ -68,7 +104,8 @@ else:
 
 # VLM API 配置
 VLM_API_KEY = os.getenv("VLM_API_KEY", "")
-VLM_BASE_URL = os.getenv("VLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+_vlm_base_env = os.getenv("VLM_BASE_URL", "").strip()
+VLM_BASE_URL = resolve_bailian_base_url(VLM_API_KEY, _vlm_base_env)
 VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-max-latest")
 
 # 天地图地理编码（MAP_API_KEY 即文档中的 tk）
